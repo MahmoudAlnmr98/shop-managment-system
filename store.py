@@ -32,22 +32,18 @@ except Exception:
         pass
 
 # ── Migration: fix customer_ledger / supplier_ledger column names ──
-# Old code used transaction_type + transaction_date, new code uses type + date
 def _migrate_ledger(table, id_col):
     try:
         C.execute(f"SELECT type FROM {table} LIMIT 1")
-        # column exists — also check 'date'
         try:
             C.execute(f"SELECT date FROM {table} LIMIT 1")
         except Exception:
-            # has 'type' but not 'date' — add it
             try:
                 C.execute(f"ALTER TABLE {table} ADD COLUMN date TEXT DEFAULT ''")
                 DB.commit()
             except Exception:
                 pass
     except Exception:
-        # 'type' column missing — recreate table from old schema
         try:
             tmp = f"{table}_old_bak"
             C.execute(f"ALTER TABLE {table} RENAME TO {tmp}")
@@ -61,7 +57,6 @@ def _migrate_ledger(table, id_col):
                     date        TEXT
                 )
             """)
-            # copy data — try old column names
             try:
                 C.execute(f"""
                     INSERT INTO {table}(id,{id_col},type,details,amount,date)
@@ -123,6 +118,8 @@ CREATE TABLE IF NOT EXISTS sales(
     customer_name TEXT DEFAULT 'كاش',
     payment_type  TEXT DEFAULT 'كاش',
     total         REAL DEFAULT 0,
+    paid_amount   REAL DEFAULT 0,
+    remaining     REAL DEFAULT 0,
     profit        REAL DEFAULT 0,
     sale_date     TEXT
 );
@@ -144,6 +141,8 @@ CREATE TABLE IF NOT EXISTS purchases(
     supplier_name TEXT DEFAULT 'نقدي',
     payment_type  TEXT DEFAULT 'نقدي',
     total         REAL DEFAULT 0,
+    paid_amount   REAL DEFAULT 0,
+    remaining     REAL DEFAULT 0,
     purchase_date TEXT
 );
 CREATE TABLE IF NOT EXISTS purchase_items(
@@ -166,11 +165,38 @@ for sql in [
     "ALTER TABLE customers ADD COLUMN phone TEXT DEFAULT ''",
     "ALTER TABLE sale_items     ADD COLUMN unit TEXT DEFAULT 'قطعة'",
     "ALTER TABLE purchase_items ADD COLUMN unit TEXT DEFAULT 'قطعة'",
+    # ── NEW: partial payment columns ──
+    "ALTER TABLE sales     ADD COLUMN paid_amount REAL DEFAULT 0",
+    "ALTER TABLE sales     ADD COLUMN remaining   REAL DEFAULT 0",
+    "ALTER TABLE purchases ADD COLUMN paid_amount REAL DEFAULT 0",
+    "ALTER TABLE purchases ADD COLUMN remaining   REAL DEFAULT 0",
 ]:
     try:
         C.execute(sql); DB.commit()
     except Exception:
         pass
+
+# ── Fix legacy rows: if paid_amount is NULL/0 and payment_type is 'كاش' set paid=total ──
+try:
+    C.execute("""
+        UPDATE sales SET paid_amount=total, remaining=0
+        WHERE (paid_amount IS NULL OR paid_amount=0) AND payment_type='كاش'
+    """)
+    C.execute("""
+        UPDATE sales SET paid_amount=0, remaining=total
+        WHERE (paid_amount IS NULL OR paid_amount=0) AND payment_type='آجل'
+    """)
+    C.execute("""
+        UPDATE purchases SET paid_amount=total, remaining=0
+        WHERE (paid_amount IS NULL OR paid_amount=0) AND payment_type='نقدي'
+    """)
+    C.execute("""
+        UPDATE purchases SET paid_amount=0, remaining=total
+        WHERE (paid_amount IS NULL OR paid_amount=0) AND payment_type='آجل'
+    """)
+    DB.commit()
+except Exception:
+    pass
 
 # ═══════════════════════════════════════════════════════
 #  HELPERS
@@ -262,56 +288,135 @@ def fill_table(t, data, red_col=None, red_thresh=5,
 # ═══════════════════════════════════════════════════════
 #  DIALOGS
 # ═══════════════════════════════════════════════════════
+
+# ── Improved Ledger Dialog with running balance ──
 class LedgerDialog(QDialog):
     def __init__(self, entity_id, entity_name, ledger_table, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"كشف حساب: {entity_name}")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(720, 500)
+        self.resize(820, 560)
         lay = QVBoxLayout(self)
 
-        title = QLabel(f"📄  كشف حساب: {entity_name}")
+        title = QLabel(f"📄  كشف حساب تفصيلي: {entity_name}")
         title.setFont(QFont("Arial", 13, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color:#1a237e;padding:8px;")
         lay.addWidget(title)
 
-        tbl = make_table(["التاريخ", "النوع", "التفاصيل", "المبلغ"])
+        # ── Table with running balance column ──
+        tbl = QTableWidget()
+        tbl.setColumnCount(5)
+        tbl.setHorizontalHeaderLabels(["التاريخ", "النوع", "التفاصيل", "المبلغ", "الرصيد التراكمي"])
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        tbl.verticalHeader().setVisible(False)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.setMinimumHeight(380)
         lay.addWidget(tbl)
-
-        summary = QLabel()
-        summary.setStyleSheet("font-weight:bold;padding:4px;color:#1a237e;")
-        lay.addWidget(summary)
 
         id_col = "customer_id" if "customer" in ledger_table else "supplier_id"
         data = rows(
             f"SELECT date, type, details, amount FROM {ledger_table} "
-            f"WHERE {id_col}=? ORDER BY id DESC",
+            f"WHERE {id_col}=? ORDER BY id ASC",
             (entity_id,)
         )
-        fill_table(tbl, data)
 
-        debits   = sum(n(r[3]) for r in data if "شراء"    in str(r[1]) or "مشتريات" in str(r[1]))
-        payments = sum(n(r[3]) for r in data if "سداد"    in str(r[1]))
-        summary.setText(
-            f"  إجمالي المشتريات: {debits:.2f}   |   "
-            f"إجمالي السدادات: {payments:.2f}   |   "
-            f"الرصيد المتبقي: {debits - payments:.2f}"
+        # Calculate running balance
+        balance   = 0.0
+        total_debt   = 0.0
+        total_paid   = 0.0
+        tbl.setRowCount(len(data))
+        for i, (date, typ, details, amount) in enumerate(data):
+            amt = n(amount)
+            is_payment = "سداد" in str(typ)
+            if is_payment:
+                balance    -= amt
+                total_paid += amt
+            else:
+                balance    += amt
+                total_debt += amt
+
+            for j, val in enumerate([date, typ, details, f"{amt:.2f}", f"{balance:.2f}"]):
+                item = QTableWidgetItem(val if val else "")
+                item.setTextAlignment(Qt.AlignCenter)
+                # Color payment rows green, debt rows red
+                if is_payment:
+                    item.setForeground(QColor("#2E7D32"))
+                else:
+                    item.setForeground(QColor("#C62828"))
+                # Highlight balance column
+                if j == 4:
+                    item.setFont(QFont("Arial", 10, QFont.Bold))
+                    if balance > 0:
+                        item.setBackground(QColor("#FFF9C4"))
+                    else:
+                        item.setBackground(QColor("#E8F5E9"))
+                tbl.setItem(i, j, item)
+        tbl.resizeColumnsToContents()
+
+        # Summary bar
+        summary = QLabel(
+            f"  📌 إجمالي المديونية: {total_debt:.2f}   |   "
+            f"✅ إجمالي السدادات: {total_paid:.2f}   |   "
+            f"💰 الرصيد المتبقي: {balance:.2f}"
         )
+        summary.setStyleSheet(
+            "font-weight:bold;padding:8px;color:#1a237e;"
+            "background:#e8eaf6;border-radius:4px;"
+        )
+        lay.addWidget(summary)
+
+        close_btn = make_btn("✖  إغلاق", "#757575", self.close, 100)
+        close_btn.setFixedWidth(120)
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        btn_lay.addWidget(close_btn)
+        lay.addLayout(btn_lay)
 
 
 class InvoiceDialog(QDialog):
+    """Sale invoice detail — shows items + payment breakdown."""
     def __init__(self, sale_id, invoice_no, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"تفاصيل الفاتورة: {invoice_no}")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(760, 420)
+        self.resize(820, 480)
         lay = QVBoxLayout(self)
 
-        title = QLabel(f"🧾  فاتورة رقم: {invoice_no}")
-        title.setFont(QFont("Arial", 12, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        lay.addWidget(title)
+        # ── Header info ──
+        sale = one(
+            "SELECT customer_name, payment_type, total, paid_amount, remaining, profit, sale_date "
+            "FROM sales WHERE id=?", (sale_id,)
+        )
+        if not sale:
+            lay.addWidget(QLabel("لم يتم العثور على الفاتورة"))
+            return
 
+        cname, ptype, total, paid, remaining, profit, sdate = sale
+        paid      = n(paid)
+        remaining = n(remaining)
+
+        hdr = QLabel(f"🧾  فاتورة رقم: {invoice_no}")
+        hdr.setFont(QFont("Arial", 12, QFont.Bold))
+        hdr.setAlignment(Qt.AlignCenter)
+        hdr.setStyleSheet("color:#1a237e;padding:4px;")
+        lay.addWidget(hdr)
+
+        # Info row
+        info_lay = QHBoxLayout()
+        for label, val, color in [
+            ("العميل", cname, "#1a237e"),
+            ("نوع الدفع", ptype, "#4527A0"),
+            ("التاريخ", sdate, "#333"),
+        ]:
+            lbl = QLabel(f"<b>{label}:</b> {val}")
+            lbl.setStyleSheet(f"color:{color};padding:4px 10px;")
+            info_lay.addWidget(lbl)
+        lay.addLayout(info_lay)
+
+        # Items table
         tbl = make_table(
             ["المنتج", "الوحدة", "الكمية", "سعر الشراء", "سعر البيع", "الإجمالي", "الربح"]
         )
@@ -323,20 +428,67 @@ class InvoiceDialog(QDialog):
         fill_table(tbl, data)
         lay.addWidget(tbl)
 
-        total  = sum(n(r[5]) for r in data)
-        profit = sum(n(r[6]) for r in data)
-        lbl = QLabel(f"  الإجمالي: {total:.2f}   |   الربح: {profit:.2f}")
-        lbl.setStyleSheet("font-weight:bold;color:#1a237e;padding:6px;")
-        lay.addWidget(lbl)
+        # Payment summary
+        pay_frame = QFrame()
+        pay_frame.setStyleSheet(
+            "background:#f3f4f6;border-radius:6px;padding:4px;"
+        )
+        pay_lay = QGridLayout(pay_frame)
+
+        def pay_lbl(text, color="#333", bold=False):
+            l = QLabel(text)
+            l.setStyleSheet(f"color:{color};{'font-weight:bold;' if bold else ''}padding:3px 8px;")
+            return l
+
+        pay_lay.addWidget(pay_lbl("إجمالي الفاتورة:", bold=True), 0, 0)
+        pay_lay.addWidget(pay_lbl(f"{n(total):.2f}", "#1a237e", True), 0, 1)
+        pay_lay.addWidget(pay_lbl("المدفوع كاش:", bold=True), 0, 2)
+        pay_lay.addWidget(pay_lbl(f"{paid:.2f}", "#2E7D32", True), 0, 3)
+        pay_lay.addWidget(pay_lbl("المتبقي (آجل):", bold=True), 0, 4)
+        remaining_color = "#C62828" if remaining > 0 else "#2E7D32"
+        pay_lay.addWidget(pay_lbl(f"{remaining:.2f}", remaining_color, True), 0, 5)
+        pay_lay.addWidget(pay_lbl("الربح:", bold=True), 0, 6)
+        pay_lay.addWidget(pay_lbl(f"{n(profit):.2f}", "#558B2F", True), 0, 7)
+        lay.addWidget(pay_frame)
 
 
 class PurchaseDetailDialog(QDialog):
+    """Purchase invoice detail — shows items + payment breakdown."""
     def __init__(self, purchase_id, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"تفاصيل الشراء رقم: #{purchase_id}")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(650, 380)
+        self.resize(720, 440)
         lay = QVBoxLayout(self)
+
+        purch = one(
+            "SELECT supplier_name, payment_type, total, paid_amount, remaining, purchase_date "
+            "FROM purchases WHERE id=?", (purchase_id,)
+        )
+        if not purch:
+            lay.addWidget(QLabel("لم يتم العثور على الفاتورة"))
+            return
+
+        sname, ptype, total, paid, remaining, pdate = purch
+        paid      = n(paid)
+        remaining = n(remaining)
+
+        hdr = QLabel(f"📦  فاتورة شراء رقم: #{purchase_id}")
+        hdr.setFont(QFont("Arial", 12, QFont.Bold))
+        hdr.setAlignment(Qt.AlignCenter)
+        hdr.setStyleSheet("color:#C62828;padding:4px;")
+        lay.addWidget(hdr)
+
+        info_lay = QHBoxLayout()
+        for label, val, color in [
+            ("المورد", sname, "#4E342E"),
+            ("نوع الدفع", ptype, "#4527A0"),
+            ("التاريخ", pdate, "#333"),
+        ]:
+            lbl = QLabel(f"<b>{label}:</b> {val}")
+            lbl.setStyleSheet(f"color:{color};padding:4px 10px;")
+            info_lay.addWidget(lbl)
+        lay.addLayout(info_lay)
 
         tbl = make_table(["المنتج", "الوحدة", "الكمية", "سعر الشراء", "الإجمالي"])
         data = rows(
@@ -347,10 +499,91 @@ class PurchaseDetailDialog(QDialog):
         fill_table(tbl, data)
         lay.addWidget(tbl)
 
-        total = sum(n(r[4]) for r in data)
-        lbl = QLabel(f"  الإجمالي: {total:.2f}")
-        lbl.setStyleSheet("font-weight:bold;color:#C62828;padding:6px;")
-        lay.addWidget(lbl)
+        pay_frame = QFrame()
+        pay_frame.setStyleSheet("background:#fce4ec;border-radius:6px;padding:4px;")
+        pay_lay = QGridLayout(pay_frame)
+
+        def pay_lbl(text, color="#333", bold=False):
+            l = QLabel(text)
+            l.setStyleSheet(f"color:{color};{'font-weight:bold;' if bold else ''}padding:3px 8px;")
+            return l
+
+        pay_lay.addWidget(pay_lbl("إجمالي الفاتورة:", bold=True), 0, 0)
+        pay_lay.addWidget(pay_lbl(f"{n(total):.2f}", "#C62828", True), 0, 1)
+        pay_lay.addWidget(pay_lbl("المدفوع:", bold=True), 0, 2)
+        pay_lay.addWidget(pay_lbl(f"{paid:.2f}", "#2E7D32", True), 0, 3)
+        pay_lay.addWidget(pay_lbl("المتبقي (آجل):", bold=True), 0, 4)
+        remaining_color = "#C62828" if remaining > 0 else "#2E7D32"
+        pay_lay.addWidget(pay_lbl(f"{remaining:.2f}", remaining_color, True), 0, 5)
+        lay.addWidget(pay_frame)
+
+
+# ═══════════════════════════════════════════════════════
+#  PARTIAL PAYMENT DIALOG
+# ═══════════════════════════════════════════════════════
+class PartialPaymentDialog(QDialog):
+    """
+    Dialog to enter a partial upfront payment for a credit sale/purchase.
+    Returns (paid_now, remaining) or (None, None) if cancelled.
+    """
+    def __init__(self, total, mode="sale", parent=None):
+        super().__init__(parent)
+        self.total = total
+        self.result_paid = None
+        self.result_remaining = None
+
+        title = "دفع جزئي — فاتورة بيع" if mode == "sale" else "دفع جزئي — فاتورة شراء"
+        self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setFixedSize(420, 220)
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel(f"<b>إجمالي الفاتورة: {total:.2f}</b>"))
+
+        form = QFormLayout()
+        self.inp_paid = QLineEdit()
+        self.inp_paid.setPlaceholderText("0.00  (اتركه فارغاً للآجل الكامل)")
+        self.inp_paid.textChanged.connect(self._update_remaining)
+        form.addRow("المدفوع الآن (كاش):", self.inp_paid)
+
+        self.lbl_remaining = QLabel(f"{total:.2f}")
+        self.lbl_remaining.setStyleSheet("font-weight:bold;color:#C62828;font-size:14px;")
+        form.addRow("المتبقي (آجل):", self.lbl_remaining)
+        lay.addLayout(form)
+
+        note = QLabel("💡 المتبقي سيُضاف للدين تلقائياً")
+        note.setStyleSheet("color:#757575;font-size:11px;")
+        lay.addWidget(note)
+
+        btns = QHBoxLayout()
+        ok_btn = make_btn("✅  تأكيد", "#2E7D32", self._confirm)
+        cancel_btn = make_btn("✖  إلغاء", "#C62828", self.reject)
+        btns.addStretch()
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+
+    def _update_remaining(self, text):
+        paid = n(text)
+        remaining = max(0.0, self.total - paid)
+        self.lbl_remaining.setText(f"{remaining:.2f}")
+        self.lbl_remaining.setStyleSheet(
+            f"font-weight:bold;font-size:14px;"
+            f"color:{'#C62828' if remaining > 0 else '#2E7D32'};"
+        )
+
+    def _confirm(self):
+        paid_text = self.inp_paid.text().strip()
+        if paid_text == "":
+            paid = 0.0
+        else:
+            paid = n(paid_text)
+        if paid < 0 or paid > self.total + 1e-6:
+            QMessageBox.warning(self, "خطأ", f"المبلغ المدفوع يجب أن يكون بين 0 و {self.total:.2f}")
+            return
+        self.result_paid      = min(paid, self.total)
+        self.result_remaining = max(0.0, self.total - self.result_paid)
+        self.accept()
 
 
 # ═══════════════════════════════════════════════════════
@@ -476,9 +709,10 @@ class ShopApp(QWidget):
         self.pos_cust_combo.setMinimumWidth(200)
         pay_lay.addWidget(QLabel("العميل (للآجل):"), 0, 0)
         pay_lay.addWidget(self.pos_cust_combo, 0, 1, 1, 3)
-        pay_lay.addWidget(make_btn("💵  بيع كاش",  "#2E7D32", self.sell_cash,   140), 1, 0)
-        pay_lay.addWidget(make_btn("📋  بيع آجل",  "#C62828", self.sell_credit, 140), 1, 1)
-        pay_lay.addWidget(make_btn("🗑  إفراغ",    "#757575", self.clear_cart,  100), 1, 2)
+        pay_lay.addWidget(make_btn("💵  بيع كاش",      "#2E7D32", self.sell_cash,          140), 1, 0)
+        pay_lay.addWidget(make_btn("📋  بيع آجل",      "#C62828", self.sell_credit,        140), 1, 1)
+        pay_lay.addWidget(make_btn("💳  بيع جزئي",     "#E65100", self.sell_partial,       140), 1, 2)
+        pay_lay.addWidget(make_btn("🗑  إفراغ",        "#757575", self.clear_cart,         100), 1, 3)
         right.addWidget(pay_grp)
 
         lay.addLayout(left,  52)
@@ -613,12 +847,16 @@ class ShopApp(QWidget):
         self.refresh_cart()
 
     def sell_cash(self):
-        self._process_sale(is_credit=False)
+        self._process_sale(mode="cash")
 
     def sell_credit(self):
-        self._process_sale(is_credit=True)
+        self._process_sale(mode="credit")
 
-    def _process_sale(self, is_credit):
+    def sell_partial(self):
+        self._process_sale(mode="partial")
+
+    def _process_sale(self, mode):
+        """mode: 'cash' | 'credit' | 'partial'"""
         if not self.cart:
             QMessageBox.warning(self, "تنبيه", "السلة فارغة!")
             return
@@ -626,11 +864,31 @@ class ShopApp(QWidget):
         cust_id   = self.pos_cust_combo.currentData()
         cust_name = self.pos_cust_combo.currentText()
 
-        if is_credit and not cust_id:
-            QMessageBox.warning(self, "خطأ", "اختر عميلاً للبيع الآجل")
+        if mode in ("credit", "partial") and not cust_id:
+            QMessageBox.warning(self, "خطأ", "اختر عميلاً للبيع الآجل أو الجزئي")
             return
 
-        # ── Validate stock from DB directly (not from display) ──
+        total  = sum(i["total"]  for i in self.cart)
+        profit = sum(i["profit"] for i in self.cart)
+
+        # ── Determine paid / remaining ──
+        if mode == "cash":
+            paid_amount = total
+            remaining   = 0.0
+            ptype       = "كاش"
+        elif mode == "credit":
+            paid_amount = 0.0
+            remaining   = total
+            ptype       = "آجل"
+        else:  # partial
+            dlg = PartialPaymentDialog(total, mode="sale", parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            paid_amount = dlg.result_paid
+            remaining   = dlg.result_remaining
+            ptype       = "جزئي"
+
+        # ── Validate stock ──
         for item in self.cart:
             res = one("SELECT quantity, unit FROM products WHERE id=?", (item["pid"],))
             if not res:
@@ -647,17 +905,14 @@ class ShopApp(QWidget):
                 )
                 return
 
-        date   = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        total  = sum(i["total"]  for i in self.cart)
-        profit = sum(i["profit"] for i in self.cart)
-        ptype  = "آجل" if is_credit else "كاش"
+        date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
 
         q(
-            "INSERT INTO sales(customer_id,customer_name,payment_type,total,profit,sale_date) "
-            "VALUES(?,?,?,?,?,?)",
-            (cust_id if is_credit else None,
-             cust_name if is_credit else "كاش",
-             ptype, total, profit, date)
+            "INSERT INTO sales(customer_id,customer_name,payment_type,total,paid_amount,remaining,profit,sale_date) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (cust_id if mode != "cash" else None,
+             cust_name if mode != "cash" else "كاش",
+             ptype, total, paid_amount, remaining, profit, date)
         )
         sale_id    = one("SELECT last_insert_rowid()")[0]
         invoice_no = f"INV-{sale_id:05d}"
@@ -675,25 +930,38 @@ class ShopApp(QWidget):
             q("UPDATE products SET quantity = ROUND(quantity - ?, 6) WHERE id=?",
               (item["qty"], item["pid"]))
 
-        if is_credit:
-            q("UPDATE customers SET total_debt = total_debt + ? WHERE id=?", (total, cust_id))
+        # ── Update customer debt only for the remaining part ──
+        if mode in ("credit", "partial") and remaining > 0:
+            q("UPDATE customers SET total_debt = total_debt + ? WHERE id=?", (remaining, cust_id))
+            details = (
+                f"فاتورة {invoice_no} — إجمالي: {total:.2f}"
+                + (f" — دفع كاش: {paid_amount:.2f}" if mode == "partial" else "")
+            )
             q(
                 "INSERT INTO customer_ledger(customer_id,type,details,amount,date) "
                 "VALUES(?,?,?,?,?)",
-                (cust_id, "مشتريات آجل", f"فاتورة {invoice_no}", total, date)
+                (cust_id,
+                 "مشتريات آجل" if mode == "credit" else "مشتريات جزئية",
+                 details, remaining, date)
             )
 
-        QMessageBox.information(
-            self, "✅ تم البيع",
+        # ── Summary message ──
+        msg = (
             f"رقم الفاتورة : {invoice_no}\n"
             f"الإجمالي     : {total:.2f}\n"
-            f"الربح         : {profit:.2f}"
-            + (f"\n\nأُضيف لحساب: {cust_name}" if is_credit else "")
+            f"الربح        : {profit:.2f}"
         )
+        if mode == "partial":
+            msg += f"\n\nالمدفوع كاش  : {paid_amount:.2f}\nالمتبقي آجل  : {remaining:.2f}"
+            msg += f"\nأُضيف للدين  : {cust_name}"
+        elif mode == "credit":
+            msg += f"\n\nأُضيف لحساب  : {cust_name}"
+
+        QMessageBox.information(self, "✅ تم البيع", msg)
 
         self.cart.clear()
         self.refresh_cart()
-        self.refresh_pos_products()     # ✅ تحديث فوري
+        self.refresh_pos_products()
         self.refresh_inventory()
         self.refresh_customers()
         self.refresh_customer_combos()
@@ -856,9 +1124,9 @@ class ShopApp(QWidget):
         hist_grp = QGroupBox("📋  سجل المشتريات الأخيرة")
         hist_lay = QVBoxLayout(hist_grp)
         self.purch_history = make_table(
-            ["#", "المورد", "الطريقة", "الإجمالي", "التاريخ", "تفاصيل"]
+            ["#", "المورد", "الطريقة", "الإجمالي", "المدفوع", "المتبقي", "التاريخ", "تفاصيل"]
         )
-        self.purch_history.setMaximumHeight(160)
+        self.purch_history.setMaximumHeight(180)
         self.purch_history.cellDoubleClicked.connect(self._show_purchase_detail)
         hist_lay.addWidget(self.purch_history)
         left.addWidget(hist_grp)
@@ -893,9 +1161,10 @@ class ShopApp(QWidget):
         self.purch_sup_combo.setMinimumWidth(200)
         sup_lay.addWidget(QLabel("المورد:"), 0, 0)
         sup_lay.addWidget(self.purch_sup_combo, 0, 1, 1, 3)
-        sup_lay.addWidget(make_btn("💵  شراء نقدي", "#2E7D32", self.purchase_cash,       140), 1, 0)
-        sup_lay.addWidget(make_btn("📋  شراء آجل",  "#C62828", self.purchase_credit,     140), 1, 1)
-        sup_lay.addWidget(make_btn("🗑  إفراغ",     "#757575", self.clear_purchase_cart, 100), 1, 2)
+        sup_lay.addWidget(make_btn("💵  شراء نقدي",  "#2E7D32", self.purchase_cash,    140), 1, 0)
+        sup_lay.addWidget(make_btn("📋  شراء آجل",   "#C62828", self.purchase_credit,  140), 1, 1)
+        sup_lay.addWidget(make_btn("💳  شراء جزئي",  "#E65100", self.purchase_partial, 140), 1, 2)
+        sup_lay.addWidget(make_btn("🗑  إفراغ",      "#757575", self.clear_purchase_cart, 100), 1, 3)
         right.addWidget(sup_grp)
 
         lay.addLayout(left,  52)
@@ -972,31 +1241,51 @@ class ShopApp(QWidget):
         self.refresh_purchase_cart()
 
     def purchase_cash(self):
-        self._process_purchase(is_credit=False)
+        self._process_purchase(mode="cash")
 
     def purchase_credit(self):
-        self._process_purchase(is_credit=True)
+        self._process_purchase(mode="credit")
 
-    def _process_purchase(self, is_credit):
+    def purchase_partial(self):
+        self._process_purchase(mode="partial")
+
+    def _process_purchase(self, mode):
+        """mode: 'cash' | 'credit' | 'partial'"""
         if not self.purchase_cart:
             QMessageBox.warning(self, "تنبيه", "سلة الشراء فارغة!"); return
 
         sup_id   = self.purch_sup_combo.currentData()
         sup_name = self.purch_sup_combo.currentText()
 
-        if is_credit and not sup_id:
-            QMessageBox.warning(self, "خطأ", "اختر مورداً للشراء الآجل"); return
+        if mode in ("credit", "partial") and not sup_id:
+            QMessageBox.warning(self, "خطأ", "اختر مورداً للشراء الآجل أو الجزئي"); return
 
-        date  = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         total = sum(i["total"] for i in self.purchase_cart)
-        ptype = "آجل" if is_credit else "نقدي"
+
+        if mode == "cash":
+            paid_amount = total
+            remaining   = 0.0
+            ptype       = "نقدي"
+        elif mode == "credit":
+            paid_amount = 0.0
+            remaining   = total
+            ptype       = "آجل"
+        else:
+            dlg = PartialPaymentDialog(total, mode="purchase", parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            paid_amount = dlg.result_paid
+            remaining   = dlg.result_remaining
+            ptype       = "جزئي"
+
+        date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
 
         q(
-            "INSERT INTO purchases(supplier_id,supplier_name,payment_type,total,purchase_date) "
-            "VALUES(?,?,?,?,?)",
-            (sup_id if is_credit else None,
-             sup_name if is_credit else "نقدي",
-             ptype, total, date)
+            "INSERT INTO purchases(supplier_id,supplier_name,payment_type,total,paid_amount,remaining,purchase_date) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (sup_id if mode != "cash" else None,
+             sup_name if mode != "cash" else "نقدي",
+             ptype, total, paid_amount, remaining, date)
         )
         purch_id = one("SELECT last_insert_rowid()")[0]
 
@@ -1008,36 +1297,47 @@ class ShopApp(QWidget):
                 (purch_id, item["pid"], item["name"], item["unit"],
                  item["cost"], item["qty"], item["total"])
             )
-            # ✅ تحديث المخزون وسعر الشراء في نفس الوقت
             q("UPDATE products SET quantity=ROUND(quantity+?,6), cost=? WHERE id=?",
               (item["qty"], item["cost"], item["pid"]))
 
-        if is_credit:
-            q("UPDATE suppliers SET total_debt=total_debt+? WHERE id=?", (total, sup_id))
+        # ── Update supplier debt for remaining only ──
+        if mode in ("credit", "partial") and remaining > 0:
+            q("UPDATE suppliers SET total_debt=total_debt+? WHERE id=?", (remaining, sup_id))
+            details = (
+                f"فاتورة شراء #{purch_id} — إجمالي: {total:.2f}"
+                + (f" — دفع كاش: {paid_amount:.2f}" if mode == "partial" else "")
+            )
             q(
                 "INSERT INTO supplier_ledger(supplier_id,type,details,amount,date) "
                 "VALUES(?,?,?,?,?)",
-                (sup_id, "مشتريات آجل", f"فاتورة شراء #{purch_id}", total, date)
+                (sup_id,
+                 "مشتريات آجل" if mode == "credit" else "مشتريات جزئية",
+                 details, remaining, date)
             )
 
-        QMessageBox.information(
-            self, "✅ تم الشراء",
+        msg = (
             f"رقم الفاتورة : #{purch_id}\n"
             f"الإجمالي     : {total:.2f}"
-            + (f"\n\nأُضيف لحساب المورد: {sup_name}" if is_credit else "")
         )
+        if mode == "partial":
+            msg += f"\n\nالمدفوع نقداً : {paid_amount:.2f}\nالمتبقي آجل  : {remaining:.2f}"
+            msg += f"\nأُضيف لحساب  : {sup_name}"
+        elif mode == "credit":
+            msg += f"\n\nأُضيف لحساب المورد: {sup_name}"
+
+        QMessageBox.information(self, "✅ تم الشراء", msg)
 
         self.purchase_cart.clear()
         self.refresh_purchase_cart()
         self.refresh_purchases_products()
         self.refresh_inventory()
-        self.refresh_pos_products()        # ✅ تحديث نقطة البيع فوراً بعد الشراء
+        self.refresh_pos_products()
         self.refresh_purchases_history()
         self.refresh_suppliers()
 
     def refresh_purchases_history(self):
         data = rows(
-            "SELECT id, supplier_name, payment_type, total, purchase_date "
+            "SELECT id, supplier_name, payment_type, total, paid_amount, remaining, purchase_date "
             "FROM purchases ORDER BY id DESC LIMIT 30"
         )
         fill_table(self.purch_history, [(*r, "🔍 عرض") for r in data])
@@ -1128,12 +1428,12 @@ class ShopApp(QWidget):
         date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         q("UPDATE customers SET total_debt=total_debt-? WHERE id=?", (amount, cid))
         q("INSERT INTO customer_ledger(customer_id,type,details,amount,date) VALUES(?,?,?,?,?)",
-          (cid, "سداد دفعة", "سداد نقدي", amount, date))
+          (cid, "سداد دفعة", f"سداد نقدي — المتبقي: {max(0, debt-amount):.2f}", amount, date))
 
         self.cust_pay_amt.clear()
         self.refresh_customers()
         QMessageBox.information(self, "✅",
-            f"تم تسديد {amount:.2f} من حساب {cname}\nالمتبقي: {debt - amount:.2f}")
+            f"تم تسديد {amount:.2f} من حساب {cname}\nالمتبقي: {max(0, debt - amount):.2f}")
 
     def show_customer_ledger(self):
         row = self.cust_table.currentRow()
@@ -1151,23 +1451,24 @@ class ShopApp(QWidget):
         cname = self.cust_table.item(row, 1).text()
 
         data = rows(
-            "SELECT invoice_no, payment_type, total, profit, sale_date "
+            "SELECT invoice_no, payment_type, total, paid_amount, remaining, profit, sale_date "
             "FROM sales WHERE customer_id=? ORDER BY id DESC",
             (cid,)
         )
-        total  = sum(n(r[2]) for r in data)
-        profit = sum(n(r[3]) for r in data)
+        total_inv   = sum(n(r[2]) for r in data)
+        total_paid  = sum(n(r[3]) for r in data)
+        total_rem   = sum(n(r[4]) for r in data)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"فواتير: {cname}")
         dlg.setLayoutDirection(Qt.RightToLeft)
-        dlg.resize(660, 440)
+        dlg.resize(780, 480)
         lay = QVBoxLayout(dlg)
-        tbl = make_table(["الفاتورة", "الدفع", "الإجمالي", "الربح", "التاريخ"])
+
+        tbl = make_table(["الفاتورة", "الدفع", "الإجمالي", "المدفوع", "المتبقي", "الربح", "التاريخ"])
         fill_table(tbl, data)
         lay.addWidget(tbl)
 
-        # ربط النقر المزدوج لفتح تفاصيل الفاتورة
         def _open_inv(r, c):
             item = tbl.item(r, 0)
             if item:
@@ -1177,8 +1478,9 @@ class ShopApp(QWidget):
         tbl.cellDoubleClicked.connect(_open_inv)
 
         lbl = QLabel(
-            f"  عدد الفواتير: {len(data)}   |   الإجمالي: {total:.2f}   |   الربح: {profit:.2f}"
-            "\n  💡 انقر مرتين على أي فاتورة لعرض محتوياتها بالتفصيل"
+            f"  عدد الفواتير: {len(data)}   |   الإجمالي: {total_inv:.2f}"
+            f"   |   المدفوع: {total_paid:.2f}   |   المتبقي: {total_rem:.2f}\n"
+            "  💡 انقر مرتين على أي فاتورة لعرض محتوياتها بالتفصيل"
         )
         lbl.setStyleSheet("font-weight:bold;color:#1a237e;padding:6px;")
         lay.addWidget(lbl)
@@ -1273,12 +1575,12 @@ class ShopApp(QWidget):
         date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         q("UPDATE suppliers SET total_debt=total_debt-? WHERE id=?", (amount, sid))
         q("INSERT INTO supplier_ledger(supplier_id,type,details,amount,date) VALUES(?,?,?,?,?)",
-          (sid, "سداد دفعة", "دفع نقدي للمورد", amount, date))
+          (sid, "سداد دفعة", f"دفع نقدي للمورد — المتبقي: {max(0, debt-amount):.2f}", amount, date))
 
         self.sup_pay_amt.clear()
         self.refresh_suppliers()
         QMessageBox.information(self, "✅",
-            f"تم تسديد {amount:.2f} للمورد {sname}\nالمتبقي: {debt - amount:.2f}")
+            f"تم تسديد {amount:.2f} للمورد {sname}\nالمتبقي: {max(0, debt - amount):.2f}")
 
     def show_supplier_ledger(self):
         row = self.sup_table.currentRow()
@@ -1296,21 +1598,36 @@ class ShopApp(QWidget):
         sname = self.sup_table.item(row, 1).text()
 
         data = rows(
-            "SELECT id, payment_type, total, purchase_date FROM purchases "
-            "WHERE supplier_id=? ORDER BY id DESC",
+            "SELECT id, payment_type, total, paid_amount, remaining, purchase_date "
+            "FROM purchases WHERE supplier_id=? ORDER BY id DESC",
             (sid,)
         )
-        total_paid = sum(n(r[2]) for r in data)
+        total_inv  = sum(n(r[2]) for r in data)
+        total_paid = sum(n(r[3]) for r in data)
+        total_rem  = sum(n(r[4]) for r in data)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"مشتريات من: {sname}")
         dlg.setLayoutDirection(Qt.RightToLeft)
-        dlg.resize(600, 400)
+        dlg.resize(720, 440)
         lay = QVBoxLayout(dlg)
-        tbl = make_table(["#", "طريقة الدفع", "الإجمالي", "التاريخ"])
+
+        tbl = make_table(["#", "طريقة الدفع", "الإجمالي", "المدفوع", "المتبقي", "التاريخ"])
         fill_table(tbl, data)
         lay.addWidget(tbl)
-        lbl = QLabel(f"  عدد الفواتير: {len(data)}   |   إجمالي المشتريات: {total_paid:.2f}")
+
+        # Double-click to open purchase detail
+        def _open_purch(r, c):
+            item = tbl.item(r, 0)
+            if item:
+                PurchaseDetailDialog(int(item.text()), self).exec()
+        tbl.cellDoubleClicked.connect(_open_purch)
+
+        lbl = QLabel(
+            f"  عدد الفواتير: {len(data)}   |   إجمالي المشتريات: {total_inv:.2f}"
+            f"   |   المدفوع: {total_paid:.2f}   |   المتبقي علينا: {total_rem:.2f}\n"
+            "  💡 انقر مرتين على أي فاتورة لعرض محتوياتها"
+        )
         lbl.setStyleSheet("font-weight:bold;color:#C62828;padding:6px;")
         lay.addWidget(lbl)
         dlg.exec()
@@ -1388,36 +1705,40 @@ class ShopApp(QWidget):
     def rpt_daily(self):
         today = datetime.now().strftime("%Y-%m-%d")
         data  = rows(
-            "SELECT invoice_no, customer_name, payment_type, total, profit, sale_date "
+            "SELECT invoice_no, customer_name, payment_type, total, paid_amount, remaining, profit, sale_date "
             "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC",
             (today + "%",)
         )
         total  = sum(n(r[3]) for r in data)
-        profit = sum(n(r[4]) for r in data)
+        paid   = sum(n(r[4]) for r in data)
+        rem    = sum(n(r[5]) for r in data)
+        profit = sum(n(r[6]) for r in data)
         self._set_report(
             f"📅  مبيعات اليوم — {today}",
-            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "الربح", "الوقت"],
+            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "المدفوع", "المتبقي", "الربح", "الوقت"],
             data,
-            f"عدد الفواتير: {len(data)}   |   "
-            f"إجمالي المبيعات: {total:.2f}   |   الأرباح: {profit:.2f}"
+            f"عدد الفواتير: {len(data)}   |   الإجمالي: {total:.2f}"
+            f"   |   المحصل: {paid:.2f}   |   المتبقي: {rem:.2f}   |   الأرباح: {profit:.2f}"
             f"   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها"
         )
 
     def rpt_monthly(self):
         month = datetime.now().strftime("%Y-%m")
         data  = rows(
-            "SELECT invoice_no, customer_name, payment_type, total, profit, sale_date "
+            "SELECT invoice_no, customer_name, payment_type, total, paid_amount, remaining, profit, sale_date "
             "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC",
             (month + "%",)
         )
         total  = sum(n(r[3]) for r in data)
-        profit = sum(n(r[4]) for r in data)
+        paid   = sum(n(r[4]) for r in data)
+        rem    = sum(n(r[5]) for r in data)
+        profit = sum(n(r[6]) for r in data)
         self._set_report(
             f"📆  مبيعات الشهر — {month}",
-            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "الربح", "التاريخ"],
+            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "المدفوع", "المتبقي", "الربح", "التاريخ"],
             data,
-            f"عدد الفواتير: {len(data)}   |   "
-            f"إجمالي المبيعات: {total:.2f}   |   الأرباح: {profit:.2f}"
+            f"عدد الفواتير: {len(data)}   |   الإجمالي: {total:.2f}"
+            f"   |   المحصل: {paid:.2f}   |   المتبقي: {rem:.2f}   |   الأرباح: {profit:.2f}"
         )
 
     def rpt_profit_monthly(self):
@@ -1425,32 +1746,39 @@ class ShopApp(QWidget):
             SELECT SUBSTR(sale_date, 1, 7),
                    COUNT(*),
                    ROUND(SUM(total),2),
+                   ROUND(SUM(paid_amount),2),
+                   ROUND(SUM(remaining),2),
                    ROUND(SUM(profit),2)
             FROM sales GROUP BY 1 ORDER BY 1 DESC
         """)
-        res    = one("SELECT COUNT(*), SUM(total), SUM(profit) FROM sales")
+        res    = one("SELECT COUNT(*), SUM(total), SUM(paid_amount), SUM(remaining), SUM(profit) FROM sales")
         total  = n(res[1]) if res else 0
-        profit = n(res[2]) if res else 0
+        paid   = n(res[2]) if res else 0
+        rem    = n(res[3]) if res else 0
+        profit = n(res[4]) if res else 0
         self._set_report(
             "💰  الأرباح — تفصيل شهري",
-            ["الشهر", "عدد الفواتير", "الإيراد", "الربح"],
+            ["الشهر", "عدد الفواتير", "الإيراد", "المحصل", "المتبقي", "الربح"],
             data,
-            f"إجمالي المبيعات الكلية: {total:.2f}   |   إجمالي الأرباح الكلية: {profit:.2f}"
+            f"الإجمالي الكلي: {total:.2f}   |   المحصل: {paid:.2f}"
+            f"   |   المتبقي: {rem:.2f}   |   الأرباح: {profit:.2f}"
         )
 
     def rpt_all_invoices(self):
         data = rows(
-            "SELECT invoice_no, customer_name, payment_type, total, profit, sale_date "
+            "SELECT invoice_no, customer_name, payment_type, total, paid_amount, remaining, profit, sale_date "
             "FROM sales ORDER BY id DESC LIMIT 2000"
         )
         total  = sum(n(r[3]) for r in data)
-        profit = sum(n(r[4]) for r in data)
+        paid   = sum(n(r[4]) for r in data)
+        rem    = sum(n(r[5]) for r in data)
+        profit = sum(n(r[6]) for r in data)
         self._set_report(
             "🧾  كل الفواتير",
-            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "الربح", "التاريخ"],
+            ["الفاتورة", "العميل", "الدفع", "الإجمالي", "المدفوع", "المتبقي", "الربح", "التاريخ"],
             data,
-            f"إجمالي الفواتير: {len(data)}   |   "
-            f"الإيراد: {total:.2f}   |   الأرباح: {profit:.2f}"
+            f"إجمالي الفواتير: {len(data)}   |   الإيراد: {total:.2f}"
+            f"   |   المحصل: {paid:.2f}   |   المتبقي: {rem:.2f}   |   الأرباح: {profit:.2f}"
             f"   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها"
         )
 
