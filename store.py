@@ -658,13 +658,15 @@ class ShopApp(QWidget):
         )
         self.pos_products.doubleClicked.connect(lambda: self._add_to_cart(qty=1.0))
         left.addWidget(
-            QLabel("  💡 انقر مرتين لإضافة 1 وحدة بسرعة  |  أو حدد الكمية واضغط 'إضافة'")
+            QLabel("  💡 انقر مرتين على المنتج لإضافة 1 وحدة  |  حدد الكمية واضغط 'إضافة' أو Enter  |  في السلة: انقر مرتين على الكمية لتعديلها")
         )
 
         add_row = QHBoxLayout()
         self.pos_qty = inp("الكمية", 100)
         self.pos_qty.setText("1")
+        self.pos_qty.returnPressed.connect(self.add_to_cart)
         self.pos_amt = inp("أو بمبلغ (جنيه)", 120)
+        self.pos_amt.returnPressed.connect(self.add_to_cart)
         add_row.addWidget(QLabel("الكمية:"))
         add_row.addWidget(self.pos_qty)
         add_row.addWidget(QLabel("  أو مبلغ:"))
@@ -689,6 +691,7 @@ class ShopApp(QWidget):
         self.cart_table.setMinimumWidth(460)
         self.cart_table.setMinimumHeight(300)
         self.cart_table.cellClicked.connect(self._cart_remove)
+        self.cart_table.cellDoubleClicked.connect(self._cart_edit_qty)
         right.addWidget(self.cart_table)
 
         tot_grp = QGroupBox("الإجماليات")
@@ -755,8 +758,11 @@ class ShopApp(QWidget):
                 try:
                     val = n(amt_val)
                     if val <= 0: raise ValueError()
+                    if price <= 0:
+                        QMessageBox.warning(self, "خطأ", "سعر البيع صفر — لا يمكن الحساب بالمبلغ")
+                        return None
                     qty = round(val / price, 4)
-                except Exception:
+                except ValueError:
                     QMessageBox.warning(self, "خطأ", "أدخل مبلغاً صحيحاً")
                     return None
             else:
@@ -842,7 +848,48 @@ class ShopApp(QWidget):
             del self.cart[row]
             self.refresh_cart()
 
+    def _cart_edit_qty(self, row, col):
+        """Double-click on col 2 (qty) to edit quantity in-place."""
+        if col != 2 or row >= len(self.cart):
+            return
+        item = self.cart[row]
+        unit = item["unit"]
+        # Read current stock from DB
+        res = one("SELECT quantity FROM products WHERE id=?", (item["pid"],))
+        max_stock = n(res[0]) if res else item["qty"]
+
+        new_qty_str, ok = QInputDialog.getText(
+            self, "تعديل الكمية",
+            f"المنتج: {item['name']}\n"
+            f"الكمية الحالية: {fmt_qty(item['qty'], unit)}\n"
+            f"المتاح في المخزون: {fmt_qty(max_stock, unit)}\n\n"
+            f"أدخل الكمية الجديدة:",
+            text=str(item["qty"])
+        )
+        if not ok or not new_qty_str.strip():
+            return
+        new_qty = n(new_qty_str)
+        if new_qty <= 0:
+            QMessageBox.warning(self, "خطأ", "الكمية يجب أن تكون أكبر من صفر"); return
+        if new_qty > max_stock + 1e-6:
+            QMessageBox.warning(
+                self, "خطأ",
+                f"المخزون غير كافٍ!\nالمتاح: {fmt_qty(max_stock, unit)}"
+            ); return
+        new_qty = round(new_qty, 6)
+        item["qty"]    = new_qty
+        item["total"]  = round(item["price"] * new_qty, 4)
+        item["profit"] = round((item["price"] - item["cost"]) * new_qty, 4)
+        self.refresh_cart()
+
     def clear_cart(self):
+        if self.cart:
+            reply = QMessageBox.question(
+                self, "تأكيد", f"هل تريد إفراغ السلة؟ ({len(self.cart)} منتج)",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
         self.cart.clear()
         self.refresh_cart()
 
@@ -871,6 +918,23 @@ class ShopApp(QWidget):
         total  = sum(i["total"]  for i in self.cart)
         profit = sum(i["profit"] for i in self.cart)
 
+        # ── Validate stock FIRST (before showing any dialog) ──
+        for item in self.cart:
+            res = one("SELECT quantity, unit FROM products WHERE id=?", (item["pid"],))
+            if not res:
+                QMessageBox.warning(self, "خطأ", f"المنتج [{item['name']}] غير موجود!")
+                return
+            db_stock = n(res[0])
+            db_unit  = res[1] or item["unit"]
+            if item["qty"] > db_stock + 1e-6:
+                QMessageBox.warning(
+                    self, "خطأ",
+                    f"المخزون غير كافٍ للمنتج: {item['name']}\n"
+                    f"المتاح: {fmt_qty(db_stock, db_unit)}\n"
+                    f"المطلوب: {fmt_qty(item['qty'], db_unit)}"
+                )
+                return
+
         # ── Determine paid / remaining ──
         if mode == "cash":
             paid_amount = total
@@ -887,23 +951,6 @@ class ShopApp(QWidget):
             paid_amount = dlg.result_paid
             remaining   = dlg.result_remaining
             ptype       = "جزئي"
-
-        # ── Validate stock ──
-        for item in self.cart:
-            res = one("SELECT quantity, unit FROM products WHERE id=?", (item["pid"],))
-            if not res:
-                QMessageBox.warning(self, "خطأ", f"المنتج [{item['name']}] غير موجود!")
-                return
-            db_stock = n(res[0])
-            db_unit  = res[1] or item["unit"]
-            if item["qty"] > db_stock + 1e-6:
-                QMessageBox.warning(
-                    self, "خطأ",
-                    f"المخزون غير كافٍ للمنتج: {item['name']}\n"
-                    f"المتاح: {fmt_qty(db_stock, db_unit)}\n"
-                    f"المطلوب: {fmt_qty(item['qty'], db_unit)}"
-                )
-                return
 
         date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
 
@@ -1089,6 +1136,7 @@ class ShopApp(QWidget):
             q("DELETE FROM products WHERE id=?", (pid,))
             self.refresh_inventory()
             self.refresh_pos_products()
+            self.refresh_purchases_products()
 
     # ══════════════════════════════════════════════
     #  TAB 3 — المشتريات
@@ -1112,7 +1160,9 @@ class ShopApp(QWidget):
         add_row = QHBoxLayout()
         self.purch_qty  = inp("الكمية (مثال: 0.5)", 160)
         self.purch_qty.setText("1")
+        self.purch_qty.returnPressed.connect(self.add_to_purchase_cart)
         self.purch_cost = inp("سعر الشراء الجديد", 130)
+        self.purch_cost.returnPressed.connect(self.add_to_purchase_cart)
         add_row.addWidget(QLabel("الكمية:"))
         add_row.addWidget(self.purch_qty)
         add_row.addWidget(QLabel("سعر الشراء:"))
@@ -1237,6 +1287,13 @@ class ShopApp(QWidget):
             self.refresh_purchase_cart()
 
     def clear_purchase_cart(self):
+        if self.purchase_cart:
+            reply = QMessageBox.question(
+                self, "تأكيد", f"هل تريد إفراغ سلة الشراء؟ ({len(self.purchase_cart)} منتج)",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
         self.purchase_cart.clear()
         self.refresh_purchase_cart()
 
@@ -1365,6 +1422,10 @@ class ShopApp(QWidget):
             ["ID", "اسم العميل", "الهاتف", "إجمالي الديون"], min_h=400
         )
 
+        self.cust_search = inp("🔍  بحث عن عميل...")
+        self.cust_search.setStyleSheet("padding:6px;font-size:13px;")
+        self.cust_search.textChanged.connect(lambda t: self.refresh_customers(t))
+
         ops_grp = QGroupBox("العمليات")
         ops_lay = QHBoxLayout(ops_grp)
         self.cust_pay_amt = inp("مبلغ السداد", 140)
@@ -1377,11 +1438,16 @@ class ShopApp(QWidget):
         ops_lay.addWidget(make_btn("🗑  حذف",         "#C62828", self.del_customer))
 
         lay.addWidget(add_grp)
+        lay.addWidget(self.cust_search)
         lay.addWidget(self.cust_table)
         lay.addWidget(ops_grp)
 
-    def refresh_customers(self):
-        data = rows("SELECT id, name, phone, total_debt FROM customers ORDER BY name")
+    def refresh_customers(self, text=""):
+        data = rows(
+            "SELECT id, name, phone, total_debt FROM customers "
+            "WHERE name LIKE ? OR phone LIKE ? ORDER BY name",
+            (f"%{text}%", f"%{text}%")
+        )
         fill_table(self.cust_table, data, amber_col=3)
 
     def refresh_customer_combos(self):
@@ -1426,14 +1492,15 @@ class ShopApp(QWidget):
             if reply == QMessageBox.No: return
 
         date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        q("UPDATE customers SET total_debt=total_debt-? WHERE id=?", (amount, cid))
+        new_debt = max(0.0, debt - amount)
+        q("UPDATE customers SET total_debt=? WHERE id=?", (new_debt, cid))
         q("INSERT INTO customer_ledger(customer_id,type,details,amount,date) VALUES(?,?,?,?,?)",
-          (cid, "سداد دفعة", f"سداد نقدي — المتبقي: {max(0, debt-amount):.2f}", amount, date))
+          (cid, "سداد دفعة", f"سداد نقدي — المتبقي: {new_debt:.2f}", amount, date))
 
         self.cust_pay_amt.clear()
         self.refresh_customers()
         QMessageBox.information(self, "✅",
-            f"تم تسديد {amount:.2f} من حساب {cname}\nالمتبقي: {max(0, debt - amount):.2f}")
+            f"تم تسديد {amount:.2f} من حساب {cname}\nالمتبقي: {new_debt:.2f}")
 
     def show_customer_ledger(self):
         row = self.cust_table.currentRow()
@@ -1520,6 +1587,10 @@ class ShopApp(QWidget):
             ["ID", "اسم المورد", "الهاتف", "المديونية (علينا)"], min_h=400
         )
 
+        self.sup_search = inp("🔍  بحث عن مورد...")
+        self.sup_search.setStyleSheet("padding:6px;font-size:13px;")
+        self.sup_search.textChanged.connect(lambda t: self.refresh_suppliers(t))
+
         ops_grp = QGroupBox("العمليات")
         ops_lay = QHBoxLayout(ops_grp)
         self.sup_pay_amt = inp("مبلغ السداد", 140)
@@ -1532,11 +1603,16 @@ class ShopApp(QWidget):
         ops_lay.addWidget(make_btn("🗑  حذف",           "#C62828", self.del_supplier))
 
         lay.addWidget(add_grp)
+        lay.addWidget(self.sup_search)
         lay.addWidget(self.sup_table)
         lay.addWidget(ops_grp)
 
-    def refresh_suppliers(self):
-        data = rows("SELECT id, name, phone, total_debt FROM suppliers ORDER BY name")
+    def refresh_suppliers(self, text=""):
+        data = rows(
+            "SELECT id, name, phone, total_debt FROM suppliers "
+            "WHERE name LIKE ? OR phone LIKE ? ORDER BY name",
+            (f"%{text}%", f"%{text}%")
+        )
         fill_table(self.sup_table, data, amber_col=3)
 
     def refresh_supplier_combos(self):
@@ -1572,15 +1648,24 @@ class ShopApp(QWidget):
         except Exception:
             QMessageBox.warning(self, "خطأ", "أدخل مبلغاً صحيحاً"); return
 
+        if amount > debt and debt > 0:
+            reply = QMessageBox.question(
+                self, "⚠️ تنبيه",
+                f"المبلغ ({amount:.2f}) أكبر من الدين ({debt:.2f}). هل تريد المتابعة؟",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No: return
+
         date = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        q("UPDATE suppliers SET total_debt=total_debt-? WHERE id=?", (amount, sid))
+        new_debt = max(0.0, debt - amount)
+        q("UPDATE suppliers SET total_debt=? WHERE id=?", (new_debt, sid))
         q("INSERT INTO supplier_ledger(supplier_id,type,details,amount,date) VALUES(?,?,?,?,?)",
-          (sid, "سداد دفعة", f"دفع نقدي للمورد — المتبقي: {max(0, debt-amount):.2f}", amount, date))
+          (sid, "سداد دفعة", f"دفع نقدي للمورد — المتبقي: {new_debt:.2f}", amount, date))
 
         self.sup_pay_amt.clear()
         self.refresh_suppliers()
         QMessageBox.information(self, "✅",
-            f"تم تسديد {amount:.2f} للمورد {sname}\nالمتبقي: {max(0, debt - amount):.2f}")
+            f"تم تسديد {amount:.2f} للمورد {sname}\nالمتبقي: {new_debt:.2f}")
 
     def show_supplier_ledger(self):
         row = self.sup_table.currentRow()
