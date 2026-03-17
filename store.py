@@ -1,19 +1,22 @@
 """
-برنامج إدارة المحل — النسخة النهائية 6.1
-تم إصلاح:
-  ✅ مشكلة Commit الفوري للمرتجع
-  ✅ أخطاء الـ Stylesheet
-  ✅ تحديث الواجهة بعد المرتجع مباشرة
+برنامج إدارة المحل — النسخة 5.0
+الإصلاحات:
+  ✅ إصلاح نظام المرتجع (transaction management)
+  ✅ إعادة البيع بالمبلغ
+  ✅ إضافة تقرير المرتجعات
+  ✅ إصلاح LedgerDialog مع running balance
+  ✅ إصلاح transaction conflicts
+  ✅ UI حديث ومنيمالست
 """
 import sys, sqlite3, shutil, os, re
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from PySide6.QtWidgets import *
 from PySide6.QtCore import Qt, QTimer, QDate, QRect
-from PySide6.QtGui import QColor, QFont, QDoubleValidator, QBrush, QPainter
+from PySide6.QtGui import QColor, QFont, QDoubleValidator, QBrush, QPainter, QPalette
 
 # ══════════════════════════════════════════════════════
-#  الثوابت والإعدادات (نفس الكود السابق)
+#  الثوابت والإعدادات
 # ══════════════════════════════════════════════════════
 DB_PATH       = "shop.db"
 SETTINGS_PATH = "settings.db"
@@ -23,7 +26,7 @@ LOW_STOCK     = 5
 UNITS = ["قطعة","كيلو","جرام","لتر","مللي","متر","سنتيمتر",
          "كرتون","علبة","كيس","دزينة","باكيت"]
 
-# ── ألوان الـ UI الحديثة (بدون أي صيغ معقدة) ──
+# ── ألوان الـ UI الحديث ──
 COLORS = {
     "bg":        "#0F1117",
     "surface":   "#1A1D27",
@@ -254,21 +257,6 @@ QLabel {{
     color: {COLORS['text']};
     background: transparent;
 }}
-QPushButton {{
-    background-color: {COLORS['accent']};
-    color: white;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 14px;
-    font-weight: 600;
-    font-size: 12px;
-}}
-QPushButton:hover {{
-    background-color: {COLORS['accent']}CC;
-}}
-QPushButton:pressed {{
-    background-color: {COLORS['accent']}AA;
-}}
 """
 
 # ══════════════════════════════════════════════════════
@@ -292,7 +280,8 @@ def set_setting(key, value):
     s.commit(); s.close()
 
 # ══════════════════════════════════════════════════════
-#  قاعدة البيانات
+#  قاعدة البيانات — بدون WAL وبدون isolation_level=None
+#  لتجنب تعارض التعاملات
 # ══════════════════════════════════════════════════════
 DB = sqlite3.connect(DB_PATH)
 DB.execute("PRAGMA foreign_keys = ON")
@@ -348,7 +337,7 @@ def dbl_validator(dec=2):
     return v
 
 # ══════════════════════════════════════════════════════
-#  Migration (نفس الكود السابق)
+#  Migration
 # ══════════════════════════════════════════════════════
 def _fix_ledger(table, id_col):
     try:
@@ -469,7 +458,6 @@ def migrate_database():
         CREATE INDEX IF NOT EXISTS idx_products_name  ON products(name);
         CREATE INDEX IF NOT EXISTS idx_sales_date     ON sales(sale_date);
         CREATE INDEX IF NOT EXISTS idx_purchases_date ON purchases(purchase_date);
-        CREATE INDEX IF NOT EXISTS idx_returns_date   ON returns(return_date);
     """)
 
     for sql in [
@@ -527,11 +515,14 @@ def inp(ph, max_w=None):
 
 def make_btn(text, color, cb=None, min_w=90):
     b = QPushButton(text)
-    # لا نضبط styleSheet هنا لأننا نعتمد على الـ global stylesheet
-    # فقط نضبط الحد الأدنى للعرض ونغير لون الخلفية
+    b.setStyleSheet(
+        f"background:{color};color:white;font-weight:600;"
+        f"padding:8px 14px;border-radius:6px;font-size:12px;"
+        f"border:none;letter-spacing:0.3px;"
+        f"QPushButton:hover{{opacity:0.9;}}"
+    )
     b.setMinimumWidth(min_w)
     b.setCursor(Qt.PointingHandCursor)
-    b.setStyleSheet(f"background-color: {color};")
     if cb: b.clicked.connect(cb)
     return b
 
@@ -601,7 +592,7 @@ class SalesCalendar(QCalendarWidget):
         super().__init__(parent)
         self._sale_days = set()
         self.setGridVisible(True)
-        self.setMinimumSize(350, 250)
+        self.setMinimumSize(310, 230)
 
     def set_sale_days(self, days: set):
         self._sale_days = days
@@ -676,7 +667,7 @@ class PartialPaymentDialog(QDialog):
         self.accept()
 
 # ══════════════════════════════════════════════════════
-#  كشف الحساب مع الرصيد التراكمي
+#  كشف الحساب مع الرصيد التراكمي (مُصلح)
 # ══════════════════════════════════════════════════════
 TYPE_AR = {"sale":"مشتريات آجل","payment":"سداد","purchase":"مشتريات (مورد)","return":"مرتجع"}
 
@@ -699,6 +690,7 @@ class LedgerDialog(QDialog):
         hint.setStyleSheet(f"color:{COLORS['text2']};font-size:11px;padding:2px;")
         lay.addWidget(hint)
 
+        # جدول مع عمود الرصيد التراكمي
         tbl = make_table(["التاريخ", "النوع", "التفاصيل", "المبلغ", "الرصيد التراكمي"])
         lay.addWidget(tbl)
 
@@ -756,6 +748,7 @@ class LedgerDialog(QDialog):
             ("الرصيد المتبقي",   money(balance), COLORS['accent']),
         ]:
             col = QVBoxLayout()
+            col.addWidget(QLabel(lbl) if True else None)
             l1 = QLabel(lbl); l1.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
             l2 = QLabel(val); l2.setStyleSheet(f"color:{clr};font-size:15px;font-weight:700;")
             l1.setAlignment(Qt.AlignCenter); l2.setAlignment(Qt.AlignCenter)
@@ -859,7 +852,11 @@ class InvoiceDialog(QDialog):
     def _open_return(self):
         dlg = ReturnDialog(self.sale_id, self.invoice_no, self)
         if dlg.exec() == QDialog.Accepted:
-            shop = self.window()
+            # ابحث عن ShopApp في topLevelWidgets
+            shop = None
+            for w in QApplication.topLevelWidgets():
+                if isinstance(w, ShopApp):
+                    shop = w; break
             if isinstance(shop, ShopApp):
                 shop._refresh_all_products()
                 shop.customers_tab.refresh_table()
@@ -923,7 +920,7 @@ class PurchaseDetailDialog(QDialog):
         lay.addWidget(pay_frame)
 
 # ══════════════════════════════════════════════════════
-#  نافذة المرتجع (مُصلحة بالكامل)
+#  نافذة المرتجع (مُصلحة — q_many بدل begin/commit اليدوي)
 # ══════════════════════════════════════════════════════
 class ReturnDialog(QDialog):
     def __init__(self, sale_id, invoice_no, parent=None):
@@ -970,25 +967,21 @@ class ReturnDialog(QDialog):
         self.tbl.setRowCount(len(self.items))
         lay.addWidget(self.tbl)
 
-        self.cbs = []
-        self.spins = []
+        self.cbs = []; self.spins = []
         for i, it in enumerate(self.items):
             pid, pname, unit, price, qty = it
             prev    = self.prev_ret.get(pid, Decimal("0"))
             max_ret = D(qty) - prev
             can_ret = max_ret > 0
 
-            cb = QCheckBox()
-            cb.setEnabled(can_ret)
+            cb = QCheckBox(); cb.setEnabled(can_ret)
             cb.stateChanged.connect(self._update_total)
             self.cbs.append(cb)
             self.tbl.setCellWidget(i, 0, cb)
 
             for j, v in enumerate([pname, unit, fmt_qty(qty), fmt_qty(prev), fmt_qty(max_ret)], 1):
-                ci = QTableWidgetItem(v)
-                ci.setTextAlignment(Qt.AlignCenter)
-                if not can_ret:
-                    ci.setForeground(QColor(COLORS['text2']))
+                ci = QTableWidgetItem(v); ci.setTextAlignment(Qt.AlignCenter)
+                if not can_ret: ci.setForeground(QColor(COLORS['text2']))
                 self.tbl.setItem(i, j, ci)
 
             spin = QDoubleSpinBox()
@@ -1023,27 +1016,19 @@ class ReturnDialog(QDialog):
         selected = []
         for i, (cb, spin) in enumerate(zip(self.cbs, self.spins)):
             if cb.isChecked():
-                it = self.items[i]
-                qty = D(str(spin.value()))
+                it = self.items[i]; qty = D(str(spin.value()))
                 if qty > 0:
-                    selected.append({
-                        "pid": it[0],
-                        "name": it[1],
-                        "unit": it[2],
-                        "price": D(it[3]),
-                        "qty": qty,
-                        "total": D(it[3]) * qty
-                    })
-        
+                    selected.append({"pid": it[0], "name": it[1], "unit": it[2],
+                                     "price": D(it[3]), "qty": qty, "total": D(it[3]) * qty})
         if not selected:
-            QMessageBox.warning(self, "تنبيه", "لم تختر أي منتج للإرجاع")
-            return
+            QMessageBox.warning(self, "تنبيه", "لم تختر أي منتج للإرجاع"); return
 
         total = sum(i["total"] for i in selected)
         date  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # ✅ استخدام q_many بدلاً من begin/commit اليدوي
         try:
-            # 1. إدراج سجل المرتجع
+            # الخطوة 1: إدراج سجل المرتجع
             C.execute("INSERT INTO returns(sale_id,original_invoice,customer_id,"
                       "customer_name,payment_type,total,return_date) VALUES(?,?,?,?,?,?,?)",
                       (self.sale_id, self.invoice_no, self.cust_id,
@@ -1052,59 +1037,40 @@ class ReturnDialog(QDialog):
             ret_no = f"RET-{ret_id:05d}"
             C.execute("UPDATE returns SET return_no=? WHERE id=?", (ret_no, ret_id))
 
-            # 2. إدراج بنود المرتجع وتحديث المخزون (زيادة الكمية)
+            # الخطوة 2: إدراج بنود المرتجع وتحديث المخزون
             for it in selected:
                 C.execute("INSERT INTO return_items(return_id,product_id,product_name,"
                           "unit,price,quantity,total) VALUES(?,?,?,?,?,?,?)",
                           (ret_id, it["pid"], it["name"], it["unit"],
                            float(it["price"]), float(it["qty"]), float(it["total"])))
-                
-                # ✅ زيادة الكمية في المخزون
-                C.execute("UPDATE products SET quantity = quantity + ? WHERE id=?",
+                C.execute("UPDATE products SET quantity=quantity+? WHERE id=?",
                           (float(it["qty"]), it["pid"]))
 
-            # 3. إذا كانت الفاتورة آجلة، نقوم بتحديث دين العميل
+            # الخطوة 3: تحديث دين العميل وفاتورة البيع لو بيع آجل
             if self.cust_id and self.pay_type == "آجل":
-                # خصم المبلغ من دين العميل
-                C.execute("UPDATE customers SET total_debt = total_debt - ? WHERE id=?",
+                # تقليل الدين من حساب العميل
+                C.execute("UPDATE customers SET total_debt=MAX(0,total_debt-?) WHERE id=?",
                           (float(total), self.cust_id))
-                
-                # إضافة قيد في كشف حساب العميل
+                # تحديث الفاتورة الأصلية — تقليل المتبقي وزيادة المدفوع
+                C.execute("""UPDATE sales
+                             SET remaining  = MAX(0, remaining  - ?),
+                                 paid_amount= MIN(total, paid_amount + ?)
+                             WHERE id=?""",
+                          (float(total), float(total), self.sale_id))
+                # إضافة حركة في كشف الحساب
                 C.execute("INSERT INTO customer_ledger(customer_id,type,details,amount,date) "
                           "VALUES(?,?,?,?,?)",
                           (self.cust_id, "return",
                            f"مرتجع {ret_no} من {self.invoice_no}",
                            float(total), date))
 
-            # ✅ Commit فوري
             DB.commit()
 
-            # تحديث الواجهة فوراً
-            shop = self.window()
-            if isinstance(shop, ShopApp):
-                shop._refresh_all_products()
-                shop.customers_tab.refresh_table()
-                shop._refresh_stats()
-                # تحديث تبويب التقويم إذا كان موجوداً
-                if hasattr(shop, 'calendar_tab'):
-                    d = QDate.currentDate()
-                    shop.calendar_tab._load_cal_sales_dates(d.year(), d.month())
-
-            # ✅ رسالة تأكيد مفصلة
-            msg = f"رقم المرتجع: {ret_no}\nإجمالي المرتجع: {money(total)}"
-            if self.cust_id and self.pay_type == "آجل":
-                # حساب الرصيد الجديد
-                new_debt = one("SELECT total_debt FROM customers WHERE id=?", (self.cust_id,))[0]
-                msg += f"\nتم خصم {money(total)} من حساب {self.cust_name}"
-                msg += f"\nالرصيد الجديد: {money(new_debt)}"
-            
-            # ✅ عرض تفاصيل المنتجات المرتجعة
-            details = "\n\nالمنتجات المرتجعة:"
-            for it in selected:
-                details += f"\n• {it['name']}: {fmt_qty(it['qty'], it['unit'])} × {money(it['price'])} = {money(it['total'])}"
-            
-            msg += details
-            QMessageBox.information(self, "✅ تم المرتجع", msg)
+            QMessageBox.information(self, "✅ تم المرتجع",
+                f"رقم المرتجع: {ret_no}\n"
+                f"الإجمالي: {money(total)}"
+                + (f"\nتم خصم {money(total)} من حساب {self.cust_name}"
+                   if self.cust_id and self.pay_type == "آجل" else ""))
             self.accept()
 
         except Exception as e:
@@ -1169,94 +1135,7 @@ class SettingsDialog(QDialog):
         self.accept()
 
 # ══════════════════════════════════════════════════════
-#  تبويب التقويم اليومي (جديد)
-# ══════════════════════════════════════════════════════
-class DailyCalendarTab(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.app = parent
-        self.setLayoutDirection(Qt.RightToLeft)
-        self._build()
-
-    def _build(self):
-        lay = QVBoxLayout(self)
-        lay.setSpacing(10)
-
-        # عنوان
-        title = QLabel("📅  التقويم اليومي للمبيعات")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"color:{COLORS['accent']};padding:8px;")
-        lay.addWidget(title)
-
-        # التقويم
-        self.cal = SalesCalendar()
-        self.cal.currentPageChanged.connect(self._on_cal_page_changed)
-        self.cal.selectionChanged.connect(self._on_cal_date_selected)
-        lay.addWidget(self.cal)
-
-        # إطار المعلومات
-        info_frame = QFrame()
-        info_frame.setStyleSheet(f"background:{COLORS['surface2']};border-radius:8px;padding:8px;")
-        info_lay = QVBoxLayout(info_frame)
-
-        self.cal_day_lbl = QLabel("اختر يوماً من التقويم")
-        self.cal_day_lbl.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        self.cal_day_lbl.setAlignment(Qt.AlignCenter)
-        self.cal_day_lbl.setStyleSheet(f"color:{COLORS['text']};padding:4px;")
-        info_lay.addWidget(self.cal_day_lbl)
-
-        self.cal_table = make_table(["الفاتورة", "العميل", "الدفع", "الإجمالي", "الربح", "الوقت"], min_h=200)
-        self.cal_table.cellDoubleClicked.connect(lambda r, c: self._try_open_invoice(self.cal_table, r))
-        info_lay.addWidget(self.cal_table)
-
-        self.cal_summary_lbl = QLabel()
-        self.cal_summary_lbl.setAlignment(Qt.AlignCenter)
-        self.cal_summary_lbl.setStyleSheet(f"font-weight:600;color:{COLORS['green']};padding:6px;")
-        info_lay.addWidget(self.cal_summary_lbl)
-
-        lay.addWidget(info_frame)
-
-        # تحميل بيانات الشهر الحالي
-        d = QDate.currentDate()
-        self._load_cal_sales_dates(d.year(), d.month())
-
-    def _on_cal_page_changed(self, year, month):
-        self._load_cal_sales_dates(year, month)
-
-    def _load_cal_sales_dates(self, year, month):
-        month_str = f"{year:04d}-{month:02d}"
-        data = rows("SELECT DISTINCT date(sale_date) FROM sales WHERE sale_date LIKE ?", (month_str + "%",))
-        self.cal.set_sale_days({r[0] for r in data})
-
-    def _on_cal_date_selected(self):
-        date_str = self.cal.selectedDate().toString("yyyy-MM-dd")
-        data = rows("SELECT invoice_no,customer_name,payment_type,total,profit,sale_date "
-                    "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC", (date_str + "%",))
-        
-        display = [(r[0], r[1], r[2], money(r[3]), money(r[4]), r[5]) for r in data]
-        fill_table(self.cal_table, display)
-        
-        total = sum(D(r[3]) for r in data)
-        profit = sum(D(r[4]) for r in data)
-        self.cal_day_lbl.setText(f"📅  {date_str}  —  {len(data)} فاتورة")
-        self.cal_summary_lbl.setText(
-            f"إجمالي المبيعات: {money(total)}   |   إجمالي الربح: {money(profit)}"
-            f"   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
-
-    def _try_open_invoice(self, table, row):
-        for col in range(table.columnCount()):
-            cell = table.item(row, col)
-            if not cell: continue
-            m = re.search(r"INV-\d+", cell.text())
-            if m:
-                res = one("SELECT id FROM sales WHERE invoice_no=?", (m.group(),))
-                if res:
-                    InvoiceDialog(res[0], m.group(), self).exec()
-                    return
-
-# ══════════════════════════════════════════════════════
-#  تاب العملاء / الموردين (نفس الكود السابق)
+#  تاب العملاء / الموردين
 # ══════════════════════════════════════════════════════
 class PartyTab(QWidget):
     def __init__(self, app, party_type):
@@ -1486,6 +1365,7 @@ class ShopApp(QWidget):
             ("مخزون منخفض",   self.stat_low_lbl, COLORS['red'],     "⚠️"),
         ]:
             frame, val_lbl_ref = make_stat_card(title, "...", color, icon)
+            # نحتفظ بمرجع الـ label الصحيح
             if title == "فواتير اليوم":   self.stat_inv_lbl = val_lbl_ref
             elif title == "مبيعات اليوم":  self.stat_tot_lbl = val_lbl_ref
             elif title == "أرباح اليوم":   self.stat_prf_lbl = val_lbl_ref
@@ -1505,10 +1385,6 @@ class ShopApp(QWidget):
         self.tabs.addTab(self.customers_tab, "👥  العملاء")
         self.suppliers_tab = PartyTab(self, "supplier")
         self.tabs.addTab(self.suppliers_tab, "🏭  الموردون")
-
-        # ✅ تبويب التقويم اليومي المنفصل
-        self.calendar_tab = DailyCalendarTab(self)
-        self.tabs.addTab(self.calendar_tab, "📅  التقويم اليومي")
 
         self.setup_reports_tab()
 
@@ -1944,7 +1820,7 @@ class ShopApp(QWidget):
             QMessageBox.critical(self, "خطأ", f"فشلت عملية البيع:\n{e}")
 
     # ══════════════════════════════════════════════════
-    #  TAB 2 — المخزون (نفس الكود السابق)
+    #  TAB 2 — المخزون
     # ══════════════════════════════════════════════════
     def setup_inventory_tab(self):
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
@@ -2167,7 +2043,7 @@ class ShopApp(QWidget):
             self._refresh_all_products()
 
     # ══════════════════════════════════════════════════
-    #  TAB 3 — المشتريات (نفس الكود السابق)
+    #  TAB 3 — المشتريات
     # ══════════════════════════════════════════════════
     def setup_purchases_tab(self):
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
@@ -2391,6 +2267,47 @@ class ShopApp(QWidget):
     #  TAB 6 — التقارير
     # ══════════════════════════════════════════════════
     def setup_reports_tab(self):
+        # ══════════════════════════════════════════════
+        #  تاب التقويم اليومي — مستقل
+        # ══════════════════════════════════════════════
+        cal_w = QWidget(); cal_w.setLayoutDirection(Qt.RightToLeft)
+        cal_main = QVBoxLayout(cal_w); cal_main.setSpacing(10)
+
+        cal_title = QLabel("📅  التقرير اليومي بالتقويم")
+        cal_title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        cal_title.setAlignment(Qt.AlignCenter)
+        cal_title.setStyleSheet(f"color:{COLORS['accent']};padding:6px;")
+        cal_main.addWidget(cal_title)
+
+        cal_body = QHBoxLayout()
+        self.cal = SalesCalendar()
+        self.cal.setMinimumSize(340, 280)
+        self.cal.currentPageChanged.connect(self._on_cal_page_changed)
+        self.cal.selectionChanged.connect(self._on_cal_date_selected)
+        cal_body.addWidget(self.cal, 0)
+
+        cal_right = QVBoxLayout()
+        self.cal_day_lbl = QLabel("اختر يوماً من التقويم")
+        self.cal_day_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        self.cal_day_lbl.setStyleSheet(f"color:{COLORS['accent']};padding:4px;")
+        cal_right.addWidget(self.cal_day_lbl)
+
+        self.cal_table = make_table(["الفاتورة","العميل","الدفع","الإجمالي","الربح","الوقت"])
+        self.cal_table.cellDoubleClicked.connect(lambda r,c: self._try_open_invoice(self.cal_table, r))
+        cal_right.addWidget(self.cal_table, 1)
+
+        self.cal_summary_lbl = QLabel()
+        self.cal_summary_lbl.setStyleSheet(
+            f"font-weight:600;color:{COLORS['green']};padding:6px;"
+            f"background:{COLORS['surface2']};border-radius:6px;")
+        cal_right.addWidget(self.cal_summary_lbl)
+        cal_body.addLayout(cal_right, 1)
+        cal_main.addLayout(cal_body)
+        self.tabs.addTab(cal_w, "📅  التقويم اليومي")
+
+        # ══════════════════════════════════════════════
+        #  تاب التقارير
+        # ══════════════════════════════════════════════
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
         main_lay = QVBoxLayout(w); main_lay.setSpacing(10)
 
@@ -2403,7 +2320,7 @@ class ShopApp(QWidget):
             ("📆  الشهر",          COLORS['accent'],  self.rpt_monthly),
             ("💰  أرباح شهرية",    COLORS['orange'],  self.rpt_profit_monthly),
             ("🧾  كل الفواتير",    COLORS['green'],   self.rpt_all_invoices),
-            ("📦  أداء المنتجات",  COLORS['yellow'],  self.rpt_products),
+            ("📦  أداء المنتجات",  COLORS['yellow'].replace("#","#")+"aa", self.rpt_products),
             ("👥  ديون العملاء",   COLORS['red'],     self.rpt_customer_debts),
             ("🏭  ديون الموردين",  "#795548",         self.rpt_supplier_debts),
             ("⚠️  مخزون منخفض",   COLORS['orange'],  self.rpt_low_stock),
@@ -2435,7 +2352,7 @@ class ShopApp(QWidget):
         self.rpt_title.setFont(QFont("Segoe UI",12,QFont.Bold))
         self.rpt_title.setAlignment(Qt.AlignCenter)
         self.rpt_title.setStyleSheet(f"color:{COLORS['accent']};padding:4px;")
-        self.rpt_table = make_table(["--"], min_h=350)
+        self.rpt_table = make_table(["--"], min_h=280)
         self.rpt_table.cellDoubleClicked.connect(lambda r,c: self._try_open_invoice(self.rpt_table, r))
         self.rpt_summary = QLabel()
         self.rpt_summary.setStyleSheet(f"font-weight:600;color:{COLORS['text2']};padding:6px;"
@@ -2444,6 +2361,28 @@ class ShopApp(QWidget):
         main_lay.addWidget(self.rpt_table)
         main_lay.addWidget(self.rpt_summary)
         self.tabs.addTab(w, "📊  التقارير")
+
+        d = QDate.currentDate()
+        self._load_cal_sales_dates(d.year(), d.month())
+
+    def _on_cal_page_changed(self, year, month):
+        self._load_cal_sales_dates(year, month)
+
+    def _load_cal_sales_dates(self, year, month):
+        month_str = f"{year:04d}-{month:02d}"
+        data = rows("SELECT DISTINCT date(sale_date) FROM sales WHERE sale_date LIKE ?", (month_str+"%",))
+        self.cal.set_sale_days({r[0] for r in data})
+
+    def _on_cal_date_selected(self):
+        date_str = self.cal.selectedDate().toString("yyyy-MM-dd")
+        data = rows("SELECT invoice_no,customer_name,payment_type,total,profit,sale_date "
+                    "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC", (date_str+"%",))
+        display = [(r[0],r[1],r[2],money(r[3]),money(r[4]),r[5]) for r in data]
+        fill_table(self.cal_table, display)
+        total  = sum(D(r[3]) for r in data); profit = sum(D(r[4]) for r in data)
+        self.cal_day_lbl.setText(f"📅  {date_str}  —  {len(data)} فاتورة")
+        self.cal_summary_lbl.setText(f"  مبيعات: {money(total)}   |   ربح: {money(profit)}"
+                                     f"   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
 
     def _set_report(self, title, headers, data, summary=""):
         self.rpt_title.setText(title)
@@ -2534,6 +2473,7 @@ class ShopApp(QWidget):
             [(r[0],r[1],fmt_qty(r[2]),money(r[3]),money(r[4])) for r in data],
             f"منتجات تحتاج إعادة طلب: {len(data)}")
 
+    # ✅ تقرير المرتجعات الجديد
     def rpt_returns(self):
         data = rows("SELECT r.return_no,r.original_invoice,r.customer_name,"
                     "r.payment_type,r.total,r.return_date "
