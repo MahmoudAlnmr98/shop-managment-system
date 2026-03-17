@@ -1,3 +1,13 @@
+"""
+برنامج إدارة المحل — النسخة 5.0
+الإصلاحات:
+  ✅ إصلاح نظام المرتجع (transaction management)
+  ✅ إعادة البيع بالمبلغ
+  ✅ إضافة تقرير المرتجعات
+  ✅ إصلاح LedgerDialog مع running balance
+  ✅ إصلاح transaction conflicts
+  ✅ UI حديث ومنيمالست
+"""
 import sys, sqlite3, shutil, os, re
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
@@ -512,10 +522,7 @@ def make_btn(text, color, cb=None, min_w=90):
         f"border:none;letter-spacing:0.3px;"
         f"}}"
         f"QPushButton:hover {{"
-        f"background:{color}CC;"
-        f"}}"
-        f"QPushButton:pressed {{"
-        f"background:{color}99;"
+        f"opacity:0.85;"
         f"}}"
     )
     b.setMinimumWidth(min_w)
@@ -649,7 +656,7 @@ class PartialPaymentDialog(QDialog):
 
     def _update_remaining(self, text):
         paid = D(text)
-        remaining = max(0.0, float(self.total - paid))
+        remaining = max(Decimal("0"), D(self.total) - paid)
         self.lbl_remaining.setText(f"{remaining:.2f}")
         clr = COLORS['red'] if remaining > 0 else COLORS['green']
         self.lbl_remaining.setStyleSheet(f"font-weight:700;font-size:14px;color:{clr};")
@@ -1043,23 +1050,30 @@ class ReturnDialog(QDialog):
                 C.execute("UPDATE products SET quantity=quantity+? WHERE id=?",
                           (float(it["qty"]), it["pid"]))
 
-            # الخطوة 3: تحديث دين العميل وفاتورة البيع لو بيع آجل
-            if self.cust_id and self.pay_type == "آجل":
-                # تقليل الدين من حساب العميل
-                C.execute("UPDATE customers SET total_debt=MAX(0,total_debt-?) WHERE id=?",
-                          (float(total), self.cust_id))
-                # تحديث الفاتورة الأصلية — تقليل المتبقي وزيادة المدفوع
-                C.execute("""UPDATE sales
-                             SET remaining  = MAX(0, remaining  - ?),
-                                 paid_amount= MIN(total, paid_amount + ?)
-                             WHERE id=?""",
-                          (float(total), float(total), self.sale_id))
-                # إضافة حركة في كشف الحساب
-                C.execute("INSERT INTO customer_ledger(customer_id,type,details,amount,date) "
-                          "VALUES(?,?,?,?,?)",
-                          (self.cust_id, "return",
-                           f"مرتجع {ret_no} من {self.invoice_no}",
-                           float(total), date))
+            # الخطوة 3: تحديث دين العميل وفاتورة البيع لو بيع آجل أو جزئي
+            if self.cust_id and self.pay_type in ("آجل", "جزئي"):
+                # احسب المتبقي الفعلي في الفاتورة الأصلية
+                sale_row = one("SELECT remaining FROM sales WHERE id=?", (self.sale_id,))
+                cur_remaining = D(sale_row[0]) if sale_row else Decimal("0")
+                # المرتجع لا يتجاوز المتبقي (الجزء الآجل فعلاً)
+                debt_reduction = min(total, cur_remaining)
+
+                if debt_reduction > 0:
+                    # تقليل الدين من حساب العميل
+                    C.execute("UPDATE customers SET total_debt=MAX(0,total_debt-?) WHERE id=?",
+                              (float(debt_reduction), self.cust_id))
+                    # تحديث الفاتورة الأصلية — تقليل المتبقي وزيادة المدفوع
+                    C.execute("""UPDATE sales
+                                 SET remaining  = MAX(0, remaining  - ?),
+                                     paid_amount= MIN(total, paid_amount + ?)
+                                 WHERE id=?""",
+                              (float(debt_reduction), float(debt_reduction), self.sale_id))
+                    # إضافة حركة في كشف الحساب
+                    C.execute("INSERT INTO customer_ledger(customer_id,type,details,amount,date) "
+                              "VALUES(?,?,?,?,?)",
+                              (self.cust_id, "return",
+                               f"مرتجع {ret_no} من {self.invoice_no}",
+                               float(debt_reduction), date))
 
             DB.commit()
 
@@ -2317,7 +2331,7 @@ class ShopApp(QWidget):
             ("📆  الشهر",          COLORS['accent'],  self.rpt_monthly),
             ("💰  أرباح شهرية",    COLORS['orange'],  self.rpt_profit_monthly),
             ("🧾  كل الفواتير",    COLORS['green'],   self.rpt_all_invoices),
-            ("📦  أداء المنتجات",  COLORS['yellow'].replace("#","#")+"aa", self.rpt_products),
+            ("📦  أداء المنتجات",  "#B8A000",         self.rpt_products),
             ("👥  ديون العملاء",   COLORS['red'],     self.rpt_customer_debts),
             ("🏭  ديون الموردين",  "#795548",         self.rpt_supplier_debts),
             ("⚠️  مخزون منخفض",   COLORS['orange'],  self.rpt_low_stock),
