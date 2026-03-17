@@ -1,13 +1,3 @@
-"""
-برنامج إدارة المحل — النسخة 5.0
-الإصلاحات:
-  ✅ إصلاح نظام المرتجع (transaction management)
-  ✅ إعادة البيع بالمبلغ
-  ✅ إضافة تقرير المرتجعات
-  ✅ إصلاح LedgerDialog مع running balance
-  ✅ إصلاح transaction conflicts
-  ✅ UI حديث ومنيمالست
-"""
 import sys, sqlite3, shutil, os, re
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
@@ -48,7 +38,7 @@ QWidget {{
     background-color: {COLORS['bg']};
     color: {COLORS['text']};
     font-family: 'Segoe UI', Tahoma, Arial;
-    font-size: 12px;
+    font-size: 10pt;
 }}
 QTabWidget::pane {{
     border: 1px solid {COLORS['border']};
@@ -62,7 +52,7 @@ QTabBar::tab {{
     min-width: 120px;
     border: none;
     font-weight: bold;
-    font-size: 12px;
+    font-size: 10pt;
 }}
 QTabBar::tab:selected {{
     background: {COLORS['accent']};
@@ -95,7 +85,7 @@ QHeaderView::section {{
     border: none;
     border-bottom: 2px solid {COLORS['accent']};
     font-weight: bold;
-    font-size: 11px;
+    font-size: 9pt;
     text-transform: uppercase;
 }}
 QLineEdit {{
@@ -104,7 +94,7 @@ QLineEdit {{
     border-radius: 6px;
     padding: 8px 12px;
     color: {COLORS['text']};
-    font-size: 12px;
+    font-size: 10pt;
 }}
 QLineEdit:focus {{
     border: 1px solid {COLORS['accent']};
@@ -147,7 +137,7 @@ QGroupBox::title {{
     subcontrol-position: top right;
     padding: 0 10px;
     color: {COLORS['accent']};
-    font-size: 12px;
+    font-size: 10pt;
 }}
 QScrollBar:vertical {{
     background: {COLORS['surface']};
@@ -516,10 +506,17 @@ def inp(ph, max_w=None):
 def make_btn(text, color, cb=None, min_w=90):
     b = QPushButton(text)
     b.setStyleSheet(
+        f"QPushButton {{"
         f"background:{color};color:white;font-weight:600;"
-        f"padding:8px 14px;border-radius:6px;font-size:12px;"
+        f"padding:8px 14px;border-radius:6px;font-size:10pt;"
         f"border:none;letter-spacing:0.3px;"
-        f"QPushButton:hover{{opacity:0.9;}}"
+        f"}}"
+        f"QPushButton:hover {{"
+        f"background:{color}CC;"
+        f"}}"
+        f"QPushButton:pressed {{"
+        f"background:{color}99;"
+        f"}}"
     )
     b.setMinimumWidth(min_w)
     b.setCursor(Qt.PointingHandCursor)
