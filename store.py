@@ -171,7 +171,12 @@ QScrollBar:horizontal {{
 QScrollBar::handle:horizontal {{
     background: {COLORS['border']};
     border-radius: 4px;
+    min-width: 30px;
 }}
+QScrollBar::handle:horizontal:hover {{
+    background: {COLORS['accent']};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QListWidget {{
     background: {COLORS['surface']};
     border: 1px solid {COLORS['border']};
@@ -455,22 +460,41 @@ def migrate_database():
             product_name TEXT, unit TEXT DEFAULT 'قطعة',
             price REAL DEFAULT 0, quantity REAL DEFAULT 0, total REAL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS purchase_returns(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            return_no TEXT,
+            purchase_id INTEGER,
+            original_purchase TEXT,
+            supplier_id INTEGER DEFAULT NULL,
+            supplier_name TEXT DEFAULT '',
+            payment_type TEXT DEFAULT 'نقدي',
+            total REAL DEFAULT 0,
+            return_date TEXT
+        );
+        CREATE TABLE IF NOT EXISTS purchase_return_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            return_id INTEGER, product_id INTEGER,
+            product_name TEXT, unit TEXT DEFAULT 'قطعة',
+            cost REAL DEFAULT 0, quantity REAL DEFAULT 0, total REAL DEFAULT 0
+        );
         CREATE INDEX IF NOT EXISTS idx_products_name  ON products(name);
         CREATE INDEX IF NOT EXISTS idx_sales_date     ON sales(sale_date);
         CREATE INDEX IF NOT EXISTS idx_purchases_date ON purchases(purchase_date);
     """)
 
     for sql in [
-        "ALTER TABLE products       ADD COLUMN unit TEXT DEFAULT 'قطعة'",
-        "ALTER TABLE products       ADD COLUMN cost REAL DEFAULT 0",
-        "ALTER TABLE products       ADD COLUMN category_id INTEGER DEFAULT NULL",
-        "ALTER TABLE customers      ADD COLUMN phone TEXT DEFAULT ''",
-        "ALTER TABLE sale_items     ADD COLUMN unit TEXT DEFAULT 'قطعة'",
-        "ALTER TABLE purchase_items ADD COLUMN unit TEXT DEFAULT 'قطعة'",
-        "ALTER TABLE sales          ADD COLUMN paid_amount REAL DEFAULT 0",
-        "ALTER TABLE sales          ADD COLUMN remaining   REAL DEFAULT 0",
-        "ALTER TABLE purchases      ADD COLUMN paid_amount REAL DEFAULT 0",
-        "ALTER TABLE purchases      ADD COLUMN remaining   REAL DEFAULT 0",
+        "ALTER TABLE products              ADD COLUMN unit TEXT DEFAULT 'قطعة'",
+        "ALTER TABLE products              ADD COLUMN cost REAL DEFAULT 0",
+        "ALTER TABLE products              ADD COLUMN category_id INTEGER DEFAULT NULL",
+        "ALTER TABLE customers             ADD COLUMN phone TEXT DEFAULT ''",
+        "ALTER TABLE sale_items            ADD COLUMN unit TEXT DEFAULT 'قطعة'",
+        "ALTER TABLE purchase_items        ADD COLUMN unit TEXT DEFAULT 'قطعة'",
+        "ALTER TABLE sales                 ADD COLUMN paid_amount REAL DEFAULT 0",
+        "ALTER TABLE sales                 ADD COLUMN remaining   REAL DEFAULT 0",
+        "ALTER TABLE purchases             ADD COLUMN paid_amount REAL DEFAULT 0",
+        "ALTER TABLE purchases             ADD COLUMN remaining   REAL DEFAULT 0",
+        "ALTER TABLE purchase_returns      ADD COLUMN supplier_id INTEGER DEFAULT NULL",
+        "ALTER TABLE supplier_ledger       ADD COLUMN type TEXT DEFAULT 'purchase'",
     ]:
         try: C.execute(sql)
         except sqlite3.OperationalError: pass
@@ -541,6 +565,11 @@ def make_table(headers, min_h=None):
     t.horizontalHeader().setStretchLastSection(True)
     t.setShowGrid(False)
     t.setFrameShape(QFrame.NoFrame)
+    t.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    # ✅ إصلاح scroll بالماوس
+    t.setFocusPolicy(Qt.StrongFocus)
+    t.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+    t.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
     if min_h: t.setMinimumHeight(min_h)
     return t
 
@@ -574,8 +603,10 @@ def make_stat_card(title, value, color, icon=""):
             padding: 4px;
         }}
     """)
+    frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    frame.setFixedHeight(72)   # ارتفاع ثابت للكروت
     lay = QVBoxLayout(frame)
-    lay.setContentsMargins(16, 10, 16, 10)
+    lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(2)
 
     title_lbl = QLabel(f"{icon}  {title}")
@@ -648,11 +679,11 @@ class PartialPaymentDialog(QDialog):
         form.addRow("المتبقي (آجل):", self.lbl_remaining)
         lay.addLayout(form)
 
-        btns = QHBoxLayout()
+        btns_w = QWidget(); btns = QHBoxLayout(btns_w); btns.setContentsMargins(0,0,0,0)
         btns.addStretch()
         btns.addWidget(make_btn("✓  تأكيد", COLORS['green'], self._confirm))
         btns.addWidget(make_btn("✕  إلغاء", COLORS['red'], self.reject))
-        lay.addLayout(btns)
+        lay.addWidget(btns_w)
 
     def _update_remaining(self, text):
         paid = D(text)
@@ -751,13 +782,12 @@ class LedgerDialog(QDialog):
             ("المرتجعات",        money(total_return), COLORS['orange']),
             ("الرصيد المتبقي",   money(balance), COLORS['accent']),
         ]:
-            col = QVBoxLayout()
-            col.addWidget(QLabel(lbl) if True else None)
+            col_w = QWidget(); col = QVBoxLayout(col_w); col.setContentsMargins(4,2,4,2)
             l1 = QLabel(lbl); l1.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
             l2 = QLabel(val); l2.setStyleSheet(f"color:{clr};font-size:15px;font-weight:700;")
             l1.setAlignment(Qt.AlignCenter); l2.setAlignment(Qt.AlignCenter)
             col.addWidget(l1); col.addWidget(l2)
-            sl.addLayout(col)
+            sl.addWidget(col_w)
             if lbl != "الرصيد المتبقي":
                 sep = QFrame(); sep.setFrameShape(QFrame.VLine)
                 sep.setStyleSheet(f"color:{COLORS['border']};")
@@ -766,9 +796,9 @@ class LedgerDialog(QDialog):
 
         close_btn = make_btn("✕  إغلاق", COLORS['surface2'], self.close, 100)
         close_btn.setStyleSheet(close_btn.styleSheet() + f"color:{COLORS['text2']};border:1px solid {COLORS['border']};")
-        btn_lay = QHBoxLayout()
+        btn_lay_w = QWidget(); btn_lay = QHBoxLayout(btn_lay_w); btn_lay.setContentsMargins(0,0,0,0)
         btn_lay.addStretch(); btn_lay.addWidget(close_btn)
-        lay.addLayout(btn_lay)
+        lay.addWidget(btn_lay_w)
 
     def _try_open_inv(self, tbl, row):
         for col in range(tbl.columnCount()):
@@ -839,19 +869,19 @@ class InvoiceDialog(QDialog):
             ("المتبقي",  money(remaining), COLORS['red'] if D(remaining) > 0 else COLORS['green']),
             ("الربح",    money(profit), COLORS['yellow']),
         ]:
-            col = QVBoxLayout()
+            col_w = QWidget(); col = QVBoxLayout(col_w); col.setContentsMargins(4,2,4,2)
             l1 = QLabel(label); l1.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
             l2 = QLabel(val);   l2.setStyleSheet(f"color:{color};font-size:16px;font-weight:700;")
             l1.setAlignment(Qt.AlignCenter); l2.setAlignment(Qt.AlignCenter)
             col.addWidget(l1); col.addWidget(l2)
-            pay_lay.addLayout(col)
+            pay_lay.addWidget(col_w)
         lay.addWidget(pay_frame)
 
-        btn_row = QHBoxLayout()
+        btn_row_w = QWidget(); btn_row = QHBoxLayout(btn_row_w); btn_row.setContentsMargins(0,0,0,0)
         btn_row.addWidget(make_btn("🔄  إنشاء مرتجع", COLORS['red'], self._open_return, 140))
         btn_row.addStretch()
         btn_row.addWidget(make_btn("✕  إغلاق", COLORS['surface2'], self.close, 90))
-        lay.addLayout(btn_row)
+        lay.addWidget(btn_row_w)
 
     def _open_return(self):
         dlg = ReturnDialog(self.sale_id, self.invoice_no, self)
@@ -915,13 +945,31 @@ class PurchaseDetailDialog(QDialog):
             ("المدفوع",  money(paid),      COLORS['green']),
             ("المتبقي",  money(remaining), COLORS['red'] if D(remaining) > 0 else COLORS['green']),
         ]:
-            col = QVBoxLayout()
+            col_w = QWidget(); col = QVBoxLayout(col_w); col.setContentsMargins(4,2,4,2)
             l1 = QLabel(label); l1.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
             l2 = QLabel(val);   l2.setStyleSheet(f"color:{color};font-size:16px;font-weight:700;")
             l1.setAlignment(Qt.AlignCenter); l2.setAlignment(Qt.AlignCenter)
             col.addWidget(l1); col.addWidget(l2)
-            pay_lay.addLayout(col)
+            pay_lay.addWidget(col_w)
         lay.addWidget(pay_frame)
+
+        # ✅ زر مرتجع المشتريات
+        self._purch_id_for_return = purchase_id
+        btn_row_w = QWidget(); btn_row = QHBoxLayout(btn_row_w); btn_row.setContentsMargins(0,0,0,0)
+        btn_row.addWidget(make_btn("🔄  إنشاء مرتجع شراء", COLORS['orange'], self._open_return, 160))
+        btn_row.addStretch()
+        btn_row.addWidget(make_btn("✕  إغلاق", COLORS['surface2'], self.close, 90))
+        lay.addWidget(btn_row_w)
+
+    def _open_return(self):
+        dlg = PurchaseReturnDialog(self._purch_id_for_return, self._purch_id_for_return, self)
+        if dlg.exec() == QDialog.Accepted:
+            for w in QApplication.topLevelWidgets():
+                if isinstance(w, ShopApp):
+                    w._refresh_all_products()
+                    w.suppliers_tab.refresh_table()
+                    break
+            self.close()
 
 # ══════════════════════════════════════════════════════
 #  نافذة المرتجع (مُصلحة — q_many بدل begin/commit اليدوي)
@@ -1003,11 +1051,11 @@ class ReturnDialog(QDialog):
         self.total_lbl.setStyleSheet(f"font-weight:700;color:{COLORS['red']};font-size:14px;padding:6px;")
         lay.addWidget(self.total_lbl)
 
-        btns = QHBoxLayout()
+        btns_w = QWidget(); btns = QHBoxLayout(btns_w); btns.setContentsMargins(0,0,0,0)
         btns.addStretch()
         btns.addWidget(make_btn("✓  تأكيد المرتجع", COLORS['red'], self._confirm, 150))
         btns.addWidget(make_btn("✕  إلغاء", COLORS['surface2'], self.reject, 90))
-        lay.addLayout(btns)
+        lay.addWidget(btns_w)
 
     def _update_total(self):
         total = Decimal("0")
@@ -1100,18 +1148,18 @@ class EditQtyDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
         lay.addWidget(QLabel(f"المتاح في المخزون: {fmt_qty(max_qty, unit)}"))
-        row = QHBoxLayout()
+        row_w = QWidget(); row = QHBoxLayout(row_w); row.setContentsMargins(0,0,0,0)
         row.addWidget(QLabel("الكمية الجديدة:"))
         self.qty_edit = QLineEdit(fmt_qty(cur_qty))
         self.qty_edit.setValidator(dbl_validator(3))
         self.qty_edit.selectAll()
         row.addWidget(self.qty_edit)
-        lay.addLayout(row)
-        btns = QHBoxLayout()
+        lay.addWidget(row_w)
+        btns_w = QWidget(); btns = QHBoxLayout(btns_w); btns.setContentsMargins(0,0,0,0)
         btns.addStretch()
         btns.addWidget(make_btn("✓", COLORS['green'], self.accept, 60))
         btns.addWidget(make_btn("✕", COLORS['red'], self.reject, 60))
-        lay.addLayout(btns)
+        lay.addWidget(btns_w)
 
     def get_qty(self) -> Decimal:
         return D(self.qty_edit.text())
@@ -1119,6 +1167,216 @@ class EditQtyDialog(QDialog):
 # ══════════════════════════════════════════════════════
 #  نافذة الإعدادات
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+#  نافذة مرتجع المشتريات
+# ══════════════════════════════════════════════════════
+class PurchaseReturnDialog(QDialog):
+    """إرجاع بضاعة لمورد من فاتورة شراء"""
+    def __init__(self, purchase_id, purchase_no, parent=None):
+        super().__init__(parent)
+        self.purchase_id  = purchase_id
+        self.purchase_no  = purchase_no
+        self.setWindowTitle(f"مرتجع شراء: #{purchase_no}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(820, 540)
+
+        purch_info = one("SELECT supplier_id,supplier_name,payment_type FROM purchases WHERE id=?",
+                         (purchase_id,))
+        self.sup_id   = purch_info[0] if purch_info else None
+        self.sup_name = purch_info[1] if purch_info else "نقدي"
+        self.pay_type = purch_info[2] if purch_info else "نقدي"
+
+        self.items = rows("SELECT product_id,product_name,unit,cost,quantity "
+                          "FROM purchase_items WHERE purchase_id=?", (purchase_id,))
+
+        # الكميات المرتجعة سابقاً لهذه الفاتورة
+        self.prev_ret = {}
+        for it in self.items:
+            pid = it[0]
+            r = one("SELECT COALESCE(SUM(pri.quantity),0) FROM purchase_return_items pri "
+                    "JOIN purchase_returns pr ON pri.return_id=pr.id "
+                    "WHERE pr.purchase_id=? AND pri.product_id=?", (purchase_id, pid))
+            self.prev_ret[pid] = D(r[0]) if r else Decimal("0")
+
+        lay = QVBoxLayout(self)
+        hdr = QLabel(f"🔄  مرتجع شراء: #{purchase_no}  |  {self.sup_name}")
+        hdr.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        hdr.setAlignment(Qt.AlignCenter)
+        hdr.setStyleSheet(f"color:{COLORS['orange']};padding:6px;")
+        lay.addWidget(hdr)
+
+        headers = ["✓","المنتج","الوحدة","مشترى","مرتجع سابق","متاح للإرجاع","الكمية"]
+        self.tbl = QTableWidget()
+        self.tbl.setColumnCount(len(headers))
+        self.tbl.setHorizontalHeaderLabels(headers)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setShowGrid(False)
+        self.tbl.setRowCount(len(self.items))
+        lay.addWidget(self.tbl)
+
+        self.cbs = []; self.spins = []
+        for i, it in enumerate(self.items):
+            pid, pname, unit, cost, qty = it
+            prev    = self.prev_ret.get(pid, Decimal("0"))
+            max_ret = D(str(qty)) - prev
+            can_ret = max_ret > 0
+
+            cb = QCheckBox(); cb.setEnabled(can_ret)
+            cb.stateChanged.connect(self._update_total)
+            self.cbs.append(cb)
+            self.tbl.setCellWidget(i, 0, cb)
+
+            for j, v in enumerate([pname, unit, fmt_qty(qty), fmt_qty(prev), fmt_qty(max_ret)], 1):
+                ci = QTableWidgetItem(v); ci.setTextAlignment(Qt.AlignCenter)
+                if not can_ret: ci.setForeground(QColor(COLORS['text2']))
+                self.tbl.setItem(i, j, ci)
+
+            spin = QDoubleSpinBox()
+            spin.setMinimum(0.001)
+            spin.setMaximum(float(max_ret) if can_ret else 0.001)
+            spin.setValue(float(max_ret) if can_ret else 0)
+            spin.setDecimals(3); spin.setEnabled(can_ret)
+            spin.valueChanged.connect(self._update_total)
+            self.spins.append(spin)
+            self.tbl.setCellWidget(i, 6, spin)
+            self.tbl.setRowHeight(i, 42)
+
+        self.total_lbl = QLabel("إجمالي المرتجع:  0.00")
+        self.total_lbl.setStyleSheet(f"font-weight:700;color:{COLORS['orange']};font-size:14px;padding:6px;")
+        lay.addWidget(self.total_lbl)
+
+        btns_w = QWidget(); btns = QHBoxLayout(btns_w); btns.setContentsMargins(0,0,0,0)
+        btns.addStretch()
+        btns.addWidget(make_btn("✓  تأكيد المرتجع", COLORS['orange'], self._confirm, 160))
+        btns.addWidget(make_btn("✕  إلغاء",          COLORS['surface2'], self.reject, 90))
+        lay.addWidget(btns_w)
+
+    def _update_total(self):
+        total = Decimal("0")
+        for i, (cb, spin) in enumerate(zip(self.cbs, self.spins)):
+            if cb.isChecked():
+                total += D(str(self.items[i][3])) * D(str(spin.value()))
+        self.total_lbl.setText(f"إجمالي المرتجع:  {money(total)}")
+
+    def _confirm(self):
+        selected = []
+        for i, (cb, spin) in enumerate(zip(self.cbs, self.spins)):
+            if cb.isChecked():
+                it = self.items[i]; qty = D(str(spin.value()))
+                if qty > 0:
+                    selected.append({"pid": it[0], "name": it[1], "unit": it[2],
+                                     "cost": D(str(it[3])), "qty": qty,
+                                     "total": D(str(it[3])) * qty})
+        if not selected:
+            QMessageBox.warning(self, "تنبيه", "لم تختر أي منتج للإرجاع"); return
+
+        total = sum(i["total"] for i in selected)
+        date  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            C.execute("INSERT INTO purchase_returns(purchase_id,original_purchase,supplier_id,"
+                      "supplier_name,payment_type,total,return_date) VALUES(?,?,?,?,?,?,?)",
+                      (self.purchase_id, str(self.purchase_no), self.sup_id,
+                       self.sup_name, self.pay_type, float(total), date))
+            ret_id  = C.lastrowid
+            ret_no  = f"PRET-{ret_id:05d}"
+            C.execute("UPDATE purchase_returns SET return_no=? WHERE id=?", (ret_no, ret_id))
+
+            for it in selected:
+                C.execute("INSERT INTO purchase_return_items(return_id,product_id,product_name,"
+                          "unit,cost,quantity,total) VALUES(?,?,?,?,?,?,?)",
+                          (ret_id, it["pid"], it["name"], it["unit"],
+                           float(it["cost"]), float(it["qty"]), float(it["total"])))
+                # تقليل الكمية من المخزون لأننا نرجع البضاعة
+                C.execute("UPDATE products SET quantity=quantity-? WHERE id=?",
+                          (float(it["qty"]), it["pid"]))
+
+            # لو الشراء كان آجل نقلل دين المورد
+            if self.sup_id and self.pay_type in ("آجل", "جزئي"):
+                purch_row = one("SELECT remaining FROM purchases WHERE id=?", (self.purchase_id,))
+                cur_rem   = D(str(purch_row[0])) if purch_row else Decimal("0")
+                debt_red  = min(total, cur_rem)
+                if debt_red > 0:
+                    C.execute("UPDATE suppliers SET total_debt=MAX(0,total_debt-?) WHERE id=?",
+                              (float(debt_red), self.sup_id))
+                    C.execute("UPDATE purchases SET remaining=MAX(0,remaining-?), "
+                              "paid_amount=MIN(total,paid_amount+?) WHERE id=?",
+                              (float(debt_red), float(debt_red), self.purchase_id))
+                    C.execute("INSERT INTO supplier_ledger(supplier_id,type,details,amount,date) "
+                              "VALUES(?,?,?,?,?)",
+                              (self.sup_id, "return",
+                               f"مرتجع {ret_no} من شراء #{self.purchase_no}",
+                               float(debt_red), date))
+
+            DB.commit()
+            QMessageBox.information(self, "✅ تم المرتجع",
+                f"رقم المرتجع: {ret_no}\nإجمالي المرتجع: {money(total)}"
+                + (f"\nتم خصم {money(total)} من حساب {self.sup_name}"
+                   if self.sup_id and self.pay_type in ("آجل","جزئي") else ""))
+            self.accept()
+        except Exception as e:
+            DB.rollback()
+            QMessageBox.critical(self, "خطأ", f"فشل المرتجع:\n{e}")
+
+
+class PurchaseReturnDetailDialog(QDialog):
+    """عرض تفاصيل فاتورة مرتجع شراء (للقراءة فقط)"""
+    def __init__(self, ret_row, parent=None):
+        super().__init__(parent)
+        ret_id, purchase_id, sup_name, pay_type, total, ret_date = ret_row
+        ret_no = one("SELECT return_no FROM purchase_returns WHERE id=?", (ret_id,))
+        ret_no = ret_no[0] if ret_no else f"PRET-{ret_id:05d}"
+        self.setWindowTitle(f"مرتجع شراء: {ret_no}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(720, 460)
+        lay = QVBoxLayout(self)
+
+        hdr = QLabel(f"🔄  مرتجع شراء  {ret_no}")
+        hdr.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        hdr.setAlignment(Qt.AlignCenter)
+        hdr.setStyleSheet(f"color:{COLORS['orange']};padding:6px;")
+        lay.addWidget(hdr)
+
+        info_frame = QFrame()
+        info_frame.setStyleSheet(f"background:{COLORS['surface2']};border-radius:8px;padding:2px;")
+        info_lay = QHBoxLayout(info_frame)
+        for label, val, color in [
+            ("المورد", sup_name, COLORS['text']),
+            ("نوع الدفع", pay_type, COLORS['accent']),
+            ("فاتورة الشراء الأصلية", f"#{purchase_id}", COLORS['text2']),
+            ("التاريخ", ret_date, COLORS['text2']),
+        ]:
+            lbl = QLabel(f"<span style='color:{COLORS['text2']};font-size:10px;'>{label}</span><br>"
+                         f"<span style='color:{color};font-weight:600;'>{val}</span>")
+            lbl.setAlignment(Qt.AlignCenter)
+            info_lay.addWidget(lbl)
+        lay.addWidget(info_frame)
+
+        tbl = make_table(["المنتج", "الوحدة", "الكمية", "سعر الشراء", "الإجمالي"])
+        items = rows("SELECT product_name,unit,quantity,cost,total FROM purchase_return_items WHERE return_id=?", (ret_id,))
+        display = [(r[0], r[1], fmt_qty(r[2]), money(r[3]), money(r[4])) for r in items]
+        fill_table(tbl, display)
+        lay.addWidget(tbl)
+
+        pay_frame = QFrame()
+        pay_frame.setStyleSheet(f"background:{COLORS['surface2']};border-radius:8px;padding:4px;")
+        pay_lay = QHBoxLayout(pay_frame)
+        col_w = QWidget(); col = QVBoxLayout(col_w); col.setContentsMargins(4,2,4,2)
+        l1 = QLabel("إجمالي المرتجع"); l1.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
+        l2 = QLabel(money(total)); l2.setStyleSheet(f"color:{COLORS['orange']};font-size:18px;font-weight:700;")
+        l1.setAlignment(Qt.AlignCenter); l2.setAlignment(Qt.AlignCenter)
+        col.addWidget(l1); col.addWidget(l2)
+        pay_lay.addWidget(col_w)
+        lay.addWidget(pay_frame)
+
+        btn_w = QWidget(); btn_lay = QHBoxLayout(btn_w); btn_lay.setContentsMargins(0,0,0,0)
+        btn_lay.addStretch()
+        btn_lay.addWidget(make_btn("✕  إغلاق", COLORS['surface2'], self.close, 90))
+        lay.addWidget(btn_w)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1135,11 +1393,11 @@ class SettingsDialog(QDialog):
         self.spin.setSuffix("  وحدة")
         gl.addRow("حد المخزون المنخفض:", self.spin)
         lay.addWidget(grp)
-        btns = QHBoxLayout()
+        btns_w = QWidget(); btns = QHBoxLayout(btns_w); btns.setContentsMargins(0,0,0,0)
         btns.addStretch()
         btns.addWidget(make_btn("💾  حفظ", COLORS['accent'], self._save))
         btns.addWidget(make_btn("إلغاء", COLORS['surface2'], self.reject, 80))
-        lay.addLayout(btns)
+        lay.addWidget(btns_w)
 
     def _save(self):
         set_setting("low_stock_threshold", str(self.spin.value()))
@@ -1164,6 +1422,7 @@ class PartyTab(QWidget):
     def _build(self):
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # إضافة
         add_grp = QGroupBox(f"إضافة {self.lbl} جديد")
@@ -1178,8 +1437,9 @@ class PartyTab(QWidget):
         self.search_edit.textChanged.connect(lambda _: self.refresh_table())
         lay.addWidget(self.search_edit)
 
-        self.table = make_table(["ID", f"اسم {self.lbl}", "الهاتف", self.debt_lbl], min_h=370)
-        lay.addWidget(self.table)
+        self.table = make_table(["ID", f"اسم {self.lbl}", "الهاتف", self.debt_lbl])
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(self.table, 1)   # stretch=1
 
         ops = QGroupBox("العمليات")
         ol = QHBoxLayout(ops)
@@ -1263,26 +1523,48 @@ class PartyTab(QWidget):
         if not pid:
             QMessageBox.warning(self, "تنبيه", "اختر عميلاً أولاً"); return
         name = self.sel_name()
-        data = rows("SELECT invoice_no,payment_type,total,paid_amount,remaining,profit,sale_date "
-                    "FROM sales WHERE customer_id=? ORDER BY id DESC", (pid,))
-        display = [(r[0],r[1],money(r[2]),money(r[3]),money(r[4]),money(r[5]),r[6]) for r in data]
-        total = sum(D(r[2]) for r in data); paid = sum(D(r[3]) for r in data)
-        rem   = sum(D(r[4]) for r in data); profit = sum(D(r[5]) for r in data)
 
-        dlg = QDialog(self); dlg.setWindowTitle(f"فواتير: {name}")
-        dlg.setLayoutDirection(Qt.RightToLeft); dlg.resize(720, 480)
+        # فواتير البيع
+        sales_data = rows("SELECT invoice_no,payment_type,total,paid_amount,remaining,profit,sale_date "
+                          "FROM sales WHERE customer_id=? ORDER BY id DESC", (pid,))
+        # المرتجعات
+        ret_data = rows("SELECT return_no,payment_type,total,return_date "
+                        "FROM returns WHERE customer_id=? ORDER BY id DESC", (pid,))
+
+        # دمج الكلّ في جدول واحد: نوع | رقم | ... | التاريخ
+        display = []
+        for r in sales_data:
+            display.append(("فاتورة بيع", r[0], r[1], money(r[2]), money(r[3]), money(r[4]), money(r[5]), r[6]))
+        for r in ret_data:
+            display.append(("مرتجع", r[0], r[1], money(r[2]), "—", "—", "—", r[3]))
+        display.sort(key=lambda x: x[7], reverse=True)
+
+        total  = sum(D(r[2]) for r in sales_data)
+        paid   = sum(D(r[3]) for r in sales_data)
+        rem    = sum(D(r[4]) for r in sales_data)
+        profit = sum(D(r[5]) for r in sales_data)
+        ret_total = sum(D(r[2]) for r in ret_data)
+
+        dlg = QDialog(self); dlg.setWindowTitle(f"فواتير وعمليات: {name}")
+        dlg.setLayoutDirection(Qt.RightToLeft); dlg.resize(820, 520)
         lay = QVBoxLayout(dlg)
-        tbl = make_table(["الفاتورة","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"])
-        fill_table(tbl, display)
-        def open_inv(r, c, t=tbl):
-            cell = t.item(r, 0)
-            if cell and cell.text().startswith("INV-"):
-                res = one("SELECT id FROM sales WHERE invoice_no=?", (cell.text(),))
-                if res: InvoiceDialog(res[0], cell.text(), self).exec()
-        tbl.cellDoubleClicked.connect(open_inv)
+        tbl = make_table(["النوع","الرقم","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"])
+        fill_table(tbl, display,
+                   col_colors=[(0, lambda v: v == "مرتجع", COLORS["red"]+"25", COLORS["red"])])
+
+        def open_row(r, c, t=tbl):
+            type_cell = t.item(r, 0)
+            num_cell  = t.item(r, 1)
+            if not type_cell or not num_cell: return
+            if type_cell.text() == "فاتورة بيع":
+                res = one("SELECT id FROM sales WHERE invoice_no=?", (num_cell.text(),))
+                if res: InvoiceDialog(res[0], num_cell.text(), self).exec()
+        tbl.cellDoubleClicked.connect(open_row)
         lay.addWidget(tbl)
-        lbl = QLabel(f"  الفواتير: {len(data)}  |  الإجمالي: {money(total)}  |  "
-                     f"المدفوع: {money(paid)}  |  المتبقي: {money(rem)}  |  ربح: {money(profit)}")
+
+        ret_note = f"   |   🔄 مرتجعات: {money(ret_total)}   |   صافي: {money(total-ret_total)}" if ret_total > 0 else ""
+        lbl = QLabel(f"  فواتير: {len(sales_data)}  |  إجمالي: {money(total)}  |  "
+                     f"مدفوع: {money(paid)}  |  متبقي: {money(rem)}  |  ربح: {money(profit)}" + ret_note)
         lbl.setStyleSheet(f"color:{COLORS['accent']};font-weight:600;padding:6px;")
         lay.addWidget(lbl)
         dlg.exec()
@@ -1292,24 +1574,53 @@ class PartyTab(QWidget):
         if not pid:
             QMessageBox.warning(self, "تنبيه", "اختر مورداً أولاً"); return
         name = self.sel_name()
-        data = rows("SELECT id,payment_type,total,paid_amount,remaining,purchase_date "
-                    "FROM purchases WHERE supplier_id=? ORDER BY id DESC", (pid,))
-        display = [(str(r[0]),r[1],money(r[2]),money(r[3]),money(r[4]),r[5]) for r in data]
-        total = sum(D(r[2]) for r in data); paid = sum(D(r[3]) for r in data)
-        rem   = sum(D(r[4]) for r in data)
 
-        dlg = QDialog(self); dlg.setWindowTitle(f"مشتريات من: {name}")
-        dlg.setLayoutDirection(Qt.RightToLeft); dlg.resize(700, 460)
+        # فواتير الشراء
+        purch_data = rows("SELECT id,payment_type,total,paid_amount,remaining,purchase_date "
+                          "FROM purchases WHERE supplier_id=? ORDER BY id DESC", (pid,))
+        # مرتجعات الشراء
+        ret_data = rows("SELECT return_no,payment_type,total,return_date "
+                        "FROM purchase_returns WHERE supplier_id=? ORDER BY id DESC", (pid,))
+
+        # دمج في جدول واحد مرتب بالتاريخ
+        display = []
+        for r in purch_data:
+            display.append(("فاتورة شراء", str(r[0]), r[1], money(r[2]),
+                            money(r[3]), money(r[4]), r[5]))
+        for r in ret_data:
+            display.append(("مرتجع", r[0], r[1], money(r[2]), "—", "—", r[3]))
+        display.sort(key=lambda x: x[6], reverse=True)
+
+        total = sum(D(r[2]) for r in purch_data)
+        paid  = sum(D(r[3]) for r in purch_data)
+        rem   = sum(D(r[4]) for r in purch_data)
+        ret_total = sum(D(r[2]) for r in ret_data)
+
+        dlg = QDialog(self); dlg.setWindowTitle(f"عمليات المورد: {name}")
+        dlg.setLayoutDirection(Qt.RightToLeft); dlg.resize(820, 500)
         lay = QVBoxLayout(dlg)
-        tbl = make_table(["#","طريقة الدفع","الإجمالي","المدفوع","المتبقي","التاريخ"])
-        fill_table(tbl, display)
-        def open_purch(r, c, t=tbl):
-            cell = t.item(r, 0)
-            if cell: PurchaseDetailDialog(int(cell.text()), self).exec()
-        tbl.cellDoubleClicked.connect(open_purch)
+        tbl = make_table(["النوع","الرقم","الدفع","الإجمالي","المدفوع","المتبقي","التاريخ"])
+        fill_table(tbl, display,
+                   col_colors=[(0, lambda v: v == "مرتجع", COLORS["orange"]+"25", COLORS["orange"])])
+
+        def open_row(r, c, t=tbl):
+            type_cell = t.item(r, 0); num_cell = t.item(r, 1)
+            if not type_cell or not num_cell: return
+            if type_cell.text() == "فاتورة شراء":
+                try: PurchaseDetailDialog(int(num_cell.text()), self).exec()
+                except ValueError: pass
+            elif type_cell.text() == "مرتجع":
+                ret_no = num_cell.text()
+                ret_row = one("SELECT id,purchase_id,supplier_name,payment_type,total,return_date "
+                              "FROM purchase_returns WHERE return_no=?", (ret_no,))
+                if ret_row:
+                    PurchaseReturnDetailDialog(ret_row, self).exec()
+        tbl.cellDoubleClicked.connect(open_row)
         lay.addWidget(tbl)
-        lbl = QLabel(f"  الفواتير: {len(data)}  |  الإجمالي: {money(total)}  |  "
-                     f"المدفوع: {money(paid)}  |  المتبقي علينا: {money(rem)}")
+
+        ret_note = f"   |   🔄 مرتجعات: {money(ret_total)}   |   صافي: {money(total-ret_total)}" if ret_total > 0 else ""
+        lbl = QLabel(f"  فواتير: {len(purch_data)}  |  إجمالي: {money(total)}  |  "
+                     f"مدفوع: {money(paid)}  |  متبقي علينا: {money(rem)}" + ret_note)
         lbl.setStyleSheet(f"color:{COLORS['red']};font-weight:600;padding:6px;")
         lay.addWidget(lbl)
         dlg.exec()
@@ -1347,7 +1658,9 @@ class ShopApp(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
 
         # ── Header ──
-        hdr_row = QHBoxLayout()
+        hdr_widget = QWidget(self)
+        hdr_row = QHBoxLayout(hdr_widget)
+        hdr_row.setContentsMargins(0,0,0,0)
         hdr = QLabel("🏪  سرجة العلا")
         hdr.setFont(QFont("Segoe UI", 18, QFont.Bold))
         hdr.setStyleSheet(f"color:white;padding:4px 0;")
@@ -1360,33 +1673,29 @@ class ShopApp(QWidget):
             btn = make_btn(text, color, cb, 130)
             btn.setStyleSheet(btn.styleSheet() + f"border:1px solid {COLORS['border']};")
             hdr_row.addWidget(btn)
-        root.addLayout(hdr_row)
+        hdr_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        root.addWidget(hdr_widget)
 
         # ── شريط الإحصاءات ──
-        self.stats_row = QHBoxLayout()
-        self.stat_inv_lbl  = QLabel("0")
-        self.stat_tot_lbl  = QLabel("0.00")
-        self.stat_prf_lbl  = QLabel("0.00")
-        self.stat_low_lbl  = QLabel("0")
-
-        for title, val_lbl, color, icon in [
-            ("فواتير اليوم",   self.stat_inv_lbl, COLORS['accent'],  "🧾"),
-            ("مبيعات اليوم",   self.stat_tot_lbl, COLORS['green'],   "💰"),
-            ("أرباح اليوم",    self.stat_prf_lbl, COLORS['yellow'],  "📈"),
-            ("مخزون منخفض",   self.stat_low_lbl, COLORS['red'],     "⚠️"),
+        stats_widget = QWidget(self)
+        stats_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        stats_lay = QHBoxLayout(stats_widget)
+        stats_lay.setContentsMargins(0,0,0,0); stats_lay.setSpacing(8)
+        for title, color, icon, attr in [
+            ("فواتير اليوم",  COLORS['accent'],  "🧾", "stat_inv_lbl"),
+            ("مبيعات اليوم",  COLORS['green'],   "💰", "stat_tot_lbl"),
+            ("أرباح اليوم",   COLORS['yellow'],  "📈", "stat_prf_lbl"),
+            ("مخزون منخفض",  COLORS['red'],     "⚠️", "stat_low_lbl"),
         ]:
             frame, val_lbl_ref = make_stat_card(title, "...", color, icon)
-            # نحتفظ بمرجع الـ label الصحيح
-            if title == "فواتير اليوم":   self.stat_inv_lbl = val_lbl_ref
-            elif title == "مبيعات اليوم":  self.stat_tot_lbl = val_lbl_ref
-            elif title == "أرباح اليوم":   self.stat_prf_lbl = val_lbl_ref
-            else:                           self.stat_low_lbl = val_lbl_ref
-            self.stats_row.addWidget(frame)
-        root.addLayout(self.stats_row)
+            setattr(self, attr, val_lbl_ref)
+            stats_lay.addWidget(frame, 1)   # stretch متساوي للكروت
+        root.addWidget(stats_widget)
 
-        # ── Tabs ──
+        # ── Tabs ── يأخذ كل المساحة الباقية دائماً
         self.tabs = QTabWidget()
-        root.addWidget(self.tabs)
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.tabs, 1)   # stretch=1 يمنع تغيير الحجم عند تغيير التاب
 
         self.setup_pos_tab()
         self.setup_inventory_tab()
@@ -1418,9 +1727,8 @@ class ShopApp(QWidget):
         res = one("SELECT COUNT(*),COALESCE(SUM(total),0),COALESCE(SUM(profit),0) "
                   "FROM sales WHERE sale_date LIKE ?", (today+"%",))
         # ✅ خصم المرتجعات من إجمالي اليوم والربح
-        ret = one("""
-            SELECT COALESCE(SUM(ri.total),0),
-                   COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+        ret_data = rows("""
+            SELECT ri.quantity, ri.total, si.price, si.cost
             FROM returns r
             JOIN return_items ri ON ri.return_id=r.id
             JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
@@ -1428,8 +1736,8 @@ class ShopApp(QWidget):
         """, (today+"%",))
         low = one("SELECT COUNT(*) FROM products WHERE quantity<?", (LOW_STOCK,))
         cnt, tot, prf = (res[0], D(res[1]), D(res[2])) if res else (0, Decimal("0"), Decimal("0"))
-        ret_tot = D(ret[0]) if ret and ret[0] else Decimal("0")
-        ret_prf = D(ret[1]) if ret and ret[1] else Decimal("0")
+        ret_tot = sum(D(str(r[1])) for r in ret_data)
+        ret_prf = sum(D(str(r[0])) * (D(str(r[2])) - D(str(r[3]))) for r in ret_data)
         lc = low[0] if low else 0
         self.stat_inv_lbl.setText(str(cnt))
         self.stat_tot_lbl.setText(money(tot - ret_tot))
@@ -1485,46 +1793,49 @@ class ShopApp(QWidget):
     # ══════════════════════════════════════════════════
     def setup_pos_tab(self):
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         lay = QHBoxLayout(w); lay.setSpacing(10)
 
         # ── يسار ──
-        left = QVBoxLayout(); left.setSpacing(8)
+        self._pos_left_w = QWidget(); self._pos_left_w.setLayoutDirection(Qt.RightToLeft)
+        left_w = self._pos_left_w
+        left = QVBoxLayout(left_w); left.setSpacing(8)
 
-        search_row = QHBoxLayout()
         self.pos_search = inp("🔍  بحث عن منتج...")
         self._pos_search_timer = QTimer(self); self._pos_search_timer.setSingleShot(True)
         self._pos_search_timer.timeout.connect(lambda: self._filter_pos_tree(self.pos_search.text()))
         self.pos_search.textChanged.connect(lambda _: self._pos_search_timer.start(300))
-        search_row.addWidget(self.pos_search)
-        left.addLayout(search_row)
+        left.addWidget(self.pos_search)
 
         self.pos_tree = QTreeWidget()
         self.pos_tree.setHeaderHidden(True)
         self.pos_tree.setAlternatingRowColors(True)
-        self.pos_tree.setMinimumHeight(360)
+        self.pos_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.pos_tree.itemClicked.connect(self._on_pos_tree_clicked)
         self.pos_tree.itemDoubleClicked.connect(self._on_pos_tree_dbl)
-        left.addWidget(self.pos_tree)
+        left.addWidget(self.pos_tree, 1)   # stretch=1
 
         self.pos_sel_lbl = QLabel("لم يتم اختيار منتج")
         self.pos_sel_lbl.setStyleSheet(f"color:{COLORS['text2']};font-size:11px;"
                                        f"background:{COLORS['surface2']};padding:6px;border-radius:4px;")
         left.addWidget(self.pos_sel_lbl)
 
-        add_row = QHBoxLayout(); add_row.setSpacing(6)
+        add_row_w = QWidget(); add_row = QHBoxLayout(add_row_w)
+        add_row.setContentsMargins(0,0,0,0); add_row.setSpacing(6)
         self.pos_qty = inp("الكمية", 110); self.pos_qty.setText("1")
         self.pos_qty.setValidator(dbl_validator(3))
-        # ✅ استعادة البيع بالمبلغ
         self.pos_amt = inp("أو بمبلغ (جنيه)", 140)
         self.pos_amt.setValidator(dbl_validator(2))
         add_row.addWidget(QLabel("كمية:")); add_row.addWidget(self.pos_qty)
         add_row.addWidget(QLabel("  مبلغ:")); add_row.addWidget(self.pos_amt)
         add_row.addWidget(make_btn("➕  إضافة", COLORS['blue'], self.add_to_cart))
         add_row.addStretch()
-        left.addLayout(add_row)
+        left.addWidget(add_row_w)
 
         # ── يمين ──
-        right = QVBoxLayout(); right.setSpacing(8)
+        self._pos_right_w = QWidget(); self._pos_right_w.setLayoutDirection(Qt.RightToLeft)
+        right_w = self._pos_right_w
+        right = QVBoxLayout(right_w); right.setSpacing(8)
 
         cart_hdr = QLabel("سلة البيع")
         cart_hdr.setFont(QFont("Segoe UI", 12, QFont.Bold))
@@ -1534,10 +1845,11 @@ class ShopApp(QWidget):
         right.addWidget(cart_hdr)
 
         self.cart_table = make_table(["المنتج","الوحدة","الكمية","السعر","الإجمالي","✕"])
-        self.cart_table.setMinimumWidth(460); self.cart_table.setMinimumHeight(320)
+        self.cart_table.setMinimumWidth(460)
+        self.cart_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.cart_table.cellClicked.connect(self._cart_cell_clicked)
         self.cart_table.cellDoubleClicked.connect(self._cart_edit_qty)
-        right.addWidget(self.cart_table)
+        right.addWidget(self.cart_table, 1)   # stretch=1
 
         hint = QLabel("  💡 انقر مرتين على صف لتعديل الكمية  |  ✕ لحذف الصنف")
         hint.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
@@ -1556,11 +1868,13 @@ class ShopApp(QWidget):
         for label, val_lbl in [("الأصناف", self.lbl_items),
                                 ("الإجمالي", self.lbl_total),
                                 ("الربح", self.lbl_profit)]:
-            col = QVBoxLayout()
+            col_w = QWidget(); col_lay = QVBoxLayout(col_w)
+            col_lay.setContentsMargins(4,2,4,2)
             l = QLabel(label); l.setStyleSheet(f"color:{COLORS['text2']};font-size:10px;")
             l.setAlignment(Qt.AlignCenter); val_lbl.setAlignment(Qt.AlignCenter)
-            col.addWidget(l); col.addWidget(val_lbl)
-            totals_lay.addLayout(col)
+            col_lay.addWidget(l); col_lay.addWidget(val_lbl)
+            totals_lay.addWidget(col_w)
+        totals_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         right.addWidget(totals_frame)
 
         pay_grp = QGroupBox("طريقة الدفع")
@@ -1572,9 +1886,13 @@ class ShopApp(QWidget):
         pay_lay.addWidget(make_btn("📋  آجل",    COLORS['red'],    self.sell_credit,  110), 1, 1)
         pay_lay.addWidget(make_btn("💳  جزئي",   COLORS['orange'], self.sell_partial, 110), 1, 2)
         pay_lay.addWidget(make_btn("🗑  إفراغ",  COLORS['surface2'], self.clear_cart, 90),  1, 3)
+        pay_grp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         right.addWidget(pay_grp)
 
-        lay.addLayout(left, 52); lay.addLayout(right, 48)
+        # السلة تأخذ المساحة الباقية فقط
+        self._pos_left_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._pos_right_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(left_w, 52); lay.addWidget(right_w, 48)
         self.tabs.addTab(w, "🛒  نقطة البيع")
 
     # ── شجرة الفئات ────────────────────────────────────
@@ -1846,6 +2164,7 @@ class ShopApp(QWidget):
     # ══════════════════════════════════════════════════
     def setup_inventory_tab(self):
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_lay = QHBoxLayout(w); main_lay.setSpacing(10)
 
         # لوحة الفئات
@@ -1863,11 +2182,11 @@ class ShopApp(QWidget):
         self.cat_name_edit = inp("فئة جديدة")
         cp_lay.addWidget(self.cat_name_edit)
 
-        cat_btns = QHBoxLayout()
+        cat_btns_w = QWidget(); cat_btns = QHBoxLayout(cat_btns_w); cat_btns.setContentsMargins(0,0,0,0)
         cat_btns.addWidget(make_btn("➕", COLORS['green'], self._add_category, 50))
         cat_btns.addWidget(make_btn("✏️", COLORS['blue'],  self._edit_category, 50))
         cat_btns.addWidget(make_btn("🗑", COLORS['red'],   self._del_category,  50))
-        cp_lay.addLayout(cat_btns)
+        cp_lay.addWidget(cat_btns_w)
         main_lay.addWidget(cat_panel)
 
         # لوحة المنتجات
@@ -1903,7 +2222,12 @@ class ShopApp(QWidget):
             ["ID","المنتج","الوحدة","الفئة","سعر الشراء","سعر البيع","المخزون","هامش %"], min_h=430)
         self.inv_table.clicked.connect(self._fill_inv_form)
 
-        lay.addWidget(add_grp); lay.addWidget(self.inv_search); lay.addWidget(self.inv_table)
+        self.inv_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(add_grp)
+        lay.addWidget(self.inv_search)
+        lay.addWidget(self.inv_table, 1)   # stretch=1
+        cat_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        right_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_lay.addWidget(right_panel, 1)
         self.tabs.addTab(w, "📦  المخزون")
         self._load_cat_combo()
@@ -2069,17 +2393,22 @@ class ShopApp(QWidget):
     # ══════════════════════════════════════════════════
     def setup_purchases_tab(self):
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         lay = QHBoxLayout(w); lay.setSpacing(10)
 
-        left = QVBoxLayout(); left.setSpacing(8)
+        self._purch_left_w = QWidget(); self._purch_left_w.setLayoutDirection(Qt.RightToLeft)
+        left_w = self._purch_left_w
+        left = QVBoxLayout(left_w); left.setSpacing(8)
         self.purch_search = inp("🔍  بحث عن منتج...")
         self.purch_search.textChanged.connect(lambda t: self.refresh_purchases_products(t))
         left.addWidget(self.purch_search)
 
-        self.purch_products = make_table(["ID","المنتج","الوحدة","سعر الشراء","المخزون"], min_h=220)
-        left.addWidget(self.purch_products)
+        self.purch_products = make_table(["ID","المنتج","الوحدة","سعر الشراء","المخزون"])
+        self.purch_products.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left.addWidget(self.purch_products, 1)   # stretch=1
 
-        add_row = QHBoxLayout(); add_row.setSpacing(6)
+        add_row_w = QWidget(); add_row = QHBoxLayout(add_row_w)
+        add_row.setContentsMargins(0,0,0,0); add_row.setSpacing(6)
         self.purch_qty  = inp("الكمية", 130); self.purch_qty.setText("1")
         self.purch_cost = inp("سعر الشراء", 130)
         self.purch_qty.setValidator(dbl_validator(3)); self.purch_cost.setValidator(dbl_validator(2))
@@ -2087,11 +2416,11 @@ class ShopApp(QWidget):
         add_row.addWidget(QLabel("سعر:")); add_row.addWidget(self.purch_cost)
         add_row.addWidget(make_btn("➕  أضف للسلة", COLORS['blue'], self.add_to_purchase_cart))
         add_row.addStretch()
-        left.addLayout(add_row)
+        left.addWidget(add_row_w)
 
         hist_grp = QGroupBox("سجل المشتريات  (انقر مرتين للتفاصيل)")
         hist_lay = QVBoxLayout(hist_grp)
-        sr = QHBoxLayout()
+        sr_w = QWidget(); sr = QHBoxLayout(sr_w); sr.setContentsMargins(0,0,0,0)
         self.purch_hist_search = inp("🔍  اسم المورد...", 180)
         self.purch_hist_from = QDateEdit(); self.purch_hist_from.setCalendarPopup(True)
         self.purch_hist_from.setDate(QDate.currentDate().addMonths(-1))
@@ -2105,14 +2434,16 @@ class ShopApp(QWidget):
         sr.addWidget(make_btn("🔍", COLORS['blue'], self.refresh_purchases_history, 40))
         sr.addWidget(make_btn("الكل", COLORS['surface2'], self._reset_purch_filter, 55))
         sr.addStretch()
-        hist_lay.addLayout(sr)
+        hist_lay.addWidget(sr_w)
         self.purch_history = make_table(["#","المورد","الطريقة","الإجمالي","المدفوع","المتبقي","التاريخ",""])
         self.purch_history.setMaximumHeight(200)
         self.purch_history.cellDoubleClicked.connect(self._show_purchase_detail)
         hist_lay.addWidget(self.purch_history)
         left.addWidget(hist_grp)
 
-        right = QVBoxLayout(); right.setSpacing(8)
+        self._purch_right_w = QWidget(); self._purch_right_w.setLayoutDirection(Qt.RightToLeft)
+        right_w = self._purch_right_w
+        right = QVBoxLayout(right_w); right.setSpacing(8)
         cart_hdr = QLabel("سلة الشراء")
         cart_hdr.setFont(QFont("Segoe UI",12,QFont.Bold))
         cart_hdr.setAlignment(Qt.AlignCenter)
@@ -2120,10 +2451,11 @@ class ShopApp(QWidget):
                                f"padding:8px;border-radius:6px;")
         right.addWidget(cart_hdr)
 
-        self.purch_cart_table = make_table(["المنتج","الوحدة","الكمية","سعر الشراء","الإجمالي","✕"], min_h=240)
+        self.purch_cart_table = make_table(["المنتج","الوحدة","الكمية","سعر الشراء","الإجمالي","✕"])
         self.purch_cart_table.setMinimumWidth(430)
+        self.purch_cart_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.purch_cart_table.cellClicked.connect(self._purch_cart_remove)
-        right.addWidget(self.purch_cart_table)
+        right.addWidget(self.purch_cart_table, 1)   # stretch=1
 
         tot_frame = QFrame()
         tot_frame.setStyleSheet(f"background:{COLORS['surface2']};border-radius:8px;padding:2px;")
@@ -2143,9 +2475,12 @@ class ShopApp(QWidget):
         sup_lay.addWidget(make_btn("📋  آجل",  COLORS['red'],    self.purchase_credit,  110), 1, 1)
         sup_lay.addWidget(make_btn("💳  جزئي", COLORS['orange'], self.purchase_partial, 110), 1, 2)
         sup_lay.addWidget(make_btn("🗑  إفراغ",COLORS['surface2'],self.clear_purchase_cart,90), 1, 3)
+        sup_grp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         right.addWidget(sup_grp)
 
-        lay.addLayout(left, 52); lay.addLayout(right, 48)
+        self._purch_left_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._purch_right_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(left_w, 52); lay.addWidget(right_w, 48)
         self.tabs.addTab(w, "🚚  المشتريات")
 
     def refresh_purchases_products(self, text=""):
@@ -2293,6 +2628,7 @@ class ShopApp(QWidget):
         #  تاب التقويم اليومي — مستقل
         # ══════════════════════════════════════════════
         cal_w = QWidget(); cal_w.setLayoutDirection(Qt.RightToLeft)
+        cal_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cal_main = QVBoxLayout(cal_w); cal_main.setSpacing(10)
 
         cal_title = QLabel("📅  التقرير اليومي بالتقويم")
@@ -2301,40 +2637,50 @@ class ShopApp(QWidget):
         cal_title.setStyleSheet(f"color:{COLORS['accent']};padding:6px;")
         cal_main.addWidget(cal_title)
 
-        cal_body = QHBoxLayout()
+        self._cal_body_w = QWidget()
+        cal_body_w = self._cal_body_w
+        cal_body = QHBoxLayout(cal_body_w); cal_body.setContentsMargins(0,0,0,0)
         self.cal = SalesCalendar()
         self.cal.setMinimumSize(340, 280)
         self.cal.currentPageChanged.connect(self._on_cal_page_changed)
         self.cal.selectionChanged.connect(self._on_cal_date_selected)
         cal_body.addWidget(self.cal, 0)
 
-        cal_right = QVBoxLayout()
+        self._cal_right_w = QWidget()
+        self._cal_right_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        cal_right_w = self._cal_right_w
+        cal_right = QVBoxLayout(cal_right_w); cal_right.setContentsMargins(0,0,0,0)
         self.cal_day_lbl = QLabel("اختر يوماً من التقويم")
         self.cal_day_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
         self.cal_day_lbl.setStyleSheet(f"color:{COLORS['accent']};padding:4px;")
         cal_right.addWidget(self.cal_day_lbl)
 
         self.cal_table = make_table(["الفاتورة","العميل","الدفع","الإجمالي","الربح","الوقت"])
+        self.cal_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.cal_table.cellDoubleClicked.connect(lambda r,c: self._try_open_invoice(self.cal_table, r))
         cal_right.addWidget(self.cal_table, 1)
 
-        self.cal_summary_lbl = QLabel()
+        self.cal_summary_lbl = QLabel("  —")
+        self.cal_summary_lbl.setFixedHeight(38)
+        self.cal_summary_lbl.setWordWrap(False)
         self.cal_summary_lbl.setStyleSheet(
             f"font-weight:600;color:{COLORS['green']};padding:6px;"
             f"background:{COLORS['surface2']};border-radius:6px;")
         cal_right.addWidget(self.cal_summary_lbl)
-        cal_body.addLayout(cal_right, 1)
-        cal_main.addLayout(cal_body)
+        cal_body.addWidget(cal_right_w, 1)
+        cal_main.addWidget(cal_body_w)
         self.tabs.addTab(cal_w, "📅  التقويم اليومي")
 
         # ══════════════════════════════════════════════
         #  تاب التقارير
         # ══════════════════════════════════════════════
         w = QWidget(); w.setLayoutDirection(Qt.RightToLeft)
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_lay = QVBoxLayout(w); main_lay.setSpacing(10)
 
         # أزرار التقارير
         btns_grp = QGroupBox("التقارير الجاهزة")
+        btns_grp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btns_lay = QHBoxLayout(btns_grp)
         btns_lay.setSpacing(6)
         for text, color, cb in [
@@ -2353,6 +2699,7 @@ class ShopApp(QWidget):
 
         # فترة مخصصة
         date_grp = QGroupBox("تقرير بفترة زمنية مخصصة")
+        date_grp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         date_lay = QHBoxLayout(date_grp)
         self.rpt_from = QDateEdit(); self.rpt_from.setCalendarPopup(True)
         self.rpt_from.setDate(QDate.currentDate().addMonths(-1))
@@ -2374,13 +2721,21 @@ class ShopApp(QWidget):
         self.rpt_title.setFont(QFont("Segoe UI",12,QFont.Bold))
         self.rpt_title.setAlignment(Qt.AlignCenter)
         self.rpt_title.setStyleSheet(f"color:{COLORS['accent']};padding:4px;")
-        self.rpt_table = make_table(["--"], min_h=280)
+        self.rpt_title.setFixedHeight(32)
+
+        self.rpt_table = make_table(["--"], min_h=240)
+        self.rpt_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.rpt_table.cellDoubleClicked.connect(lambda r,c: self._try_open_invoice(self.rpt_table, r))
-        self.rpt_summary = QLabel()
+
+        # ✅ rpt_summary بارتفاع ثابت — هذا يمنع الـ layout shift
+        self.rpt_summary = QLabel("  —")
+        self.rpt_summary.setFixedHeight(38)
+        self.rpt_summary.setWordWrap(False)
         self.rpt_summary.setStyleSheet(f"font-weight:600;color:{COLORS['text2']};padding:6px;"
                                        f"background:{COLORS['surface2']};border-radius:6px;")
+
         main_lay.addWidget(self.rpt_title)
-        main_lay.addWidget(self.rpt_table)
+        main_lay.addWidget(self.rpt_table, 1)   # stretch=1 يجعل الجدول يأخذ المساحة المتبقية
         main_lay.addWidget(self.rpt_summary)
         self.tabs.addTab(w, "📊  التقارير")
 
@@ -2417,17 +2772,17 @@ class ShopApp(QWidget):
         self.rpt_summary.setText(summary)
 
     def _get_returns_summary(self, date_filter_col, date_val):
-        """دالة مساعدة: تحسب إجمالي المرتجعات وربحها لفترة معينة"""
-        ret = one(f"""
-            SELECT COALESCE(SUM(ri.total),0),
-                   COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+        """تحسب إجمالي المرتجعات وربحها — حساب Decimal في Python لا SQL"""
+        data = rows(f"""
+            SELECT ri.quantity, ri.total, si.price, si.cost
             FROM returns r
             JOIN return_items ri ON ri.return_id=r.id
             JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
             WHERE r.{date_filter_col} LIKE ?
         """, (date_val,))
-        return (D(ret[0]) if ret and ret[0] else Decimal("0"),
-                D(ret[1]) if ret and ret[1] else Decimal("0"))
+        ret_tot = sum(D(str(r[1])) for r in data)
+        ret_prf = sum(D(str(r[0])) * (D(str(r[2])) - D(str(r[3]))) for r in data)
+        return ret_tot, ret_prf
 
     def rpt_daily(self):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -2470,11 +2825,11 @@ class ShopApp(QWidget):
         rem=D(res[3]) if res and res[3] else Decimal("0")
         profit=D(res[4]) if res and res[4] else Decimal("0")
         # إجمالي المرتجعات الكلية
-        all_ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+        all_ret_data = rows("""SELECT ri.quantity,ri.total,si.price,si.cost
                          FROM return_items ri JOIN returns r ON ri.return_id=r.id
                          JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id""")
-        ret_tot=D(all_ret[0]) if all_ret and all_ret[0] else Decimal("0")
-        ret_prf=D(all_ret[1]) if all_ret and all_ret[1] else Decimal("0")
+        ret_tot = sum(D(str(r[1])) for r in all_ret_data)
+        ret_prf = sum(D(str(r[0]))*(D(str(r[2]))-D(str(r[3]))) for r in all_ret_data)
         self._set_report("💰  الأرباح — تفصيل شهري",
             ["الشهر","عدد الفواتير","الإيراد","المدفوع","المتبقي","الربح"],
             [(r[0],str(r[1]),money(r[2]),money(r[3]),money(r[4]),money(r[5])) for r in data],
@@ -2488,11 +2843,11 @@ class ShopApp(QWidget):
                     "FROM sales ORDER BY id DESC LIMIT 2000")
         total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
         rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
-        all_ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+        all_ret_rows = rows("""SELECT ri.quantity,ri.total,si.price,si.cost
                          FROM return_items ri JOIN returns r ON ri.return_id=r.id
                          JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id""")
-        ret_tot=D(all_ret[0]) if all_ret and all_ret[0] else Decimal("0")
-        ret_prf=D(all_ret[1]) if all_ret and all_ret[1] else Decimal("0")
+        ret_tot = sum(D(str(r[1])) for r in all_ret_rows)
+        ret_prf = sum(D(str(r[0]))*(D(str(r[2]))-D(str(r[3]))) for r in all_ret_rows)
         self._set_report("🧾  كل الفواتير",
             ["الفاتورة","العميل","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"],
             [(r[0],r[1],r[2],money(r[3]),money(r[4]),money(r[5]),money(r[6]),r[7]) for r in data],
@@ -2503,32 +2858,30 @@ class ShopApp(QWidget):
             + "   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها")
 
     def rpt_products(self):
+        # نجيب بيانات المبيعات الخام
         data = rows("""
-            SELECT si.product_name, si.unit,
-                   ROUND(SUM(si.quantity),3)       AS sold_qty,
-                   ROUND(SUM(si.total),2)           AS revenue,
-                   ROUND(SUM(si.profit),2)          AS profit,
-                   ROUND(AVG(si.price),2)            AS avg_price,
-                   COALESCE((
-                       SELECT SUM(ri.quantity) FROM return_items ri
-                       JOIN returns r ON ri.return_id=r.id
-                       WHERE ri.product_id=si.product_id
-                   ),0)                              AS ret_qty,
-                   COALESCE((
-                       SELECT SUM(ri.total) FROM return_items ri
-                       JOIN returns r ON ri.return_id=r.id
-                       WHERE ri.product_id=si.product_id
-                   ),0)                              AS ret_total
+            SELECT si.product_id, si.product_name, si.unit,
+                   SUM(si.quantity) AS sold_qty,
+                   SUM(si.total)    AS revenue,
+                   SUM(si.profit)   AS profit,
+                   AVG(si.price)    AS avg_price
             FROM sale_items si
             GROUP BY si.product_id, si.product_name
             ORDER BY sold_qty DESC
         """)
+        # نجيب المرتجعات لكل منتج بـ Decimal في Python
         display = []
         for r in data:
-            net_qty = D(r[2]) - D(r[6])
-            net_rev = D(r[3]) - D(r[7])
-            display.append((r[0], r[1], fmt_qty(net_qty), money(net_rev),
-                            money(r[4]), money(r[5])))
+            pid = r[0]
+            ret_rows = rows("""SELECT ri.quantity, ri.price*ri.quantity
+                               FROM return_items ri JOIN returns ret ON ri.return_id=ret.id
+                               WHERE ri.product_id=?""", (pid,))
+            ret_qty = sum(D(str(rr[0])) for rr in ret_rows)
+            ret_rev = sum(D(str(rr[1])) for rr in ret_rows)
+            net_qty = D(str(r[3])) - ret_qty
+            net_rev = D(str(r[4])) - ret_rev
+            display.append((r[1], r[2], fmt_qty(net_qty), money(net_rev),
+                            money(D(str(r[5]))), money(D(str(r[6])))))
         self._set_report("📦  أداء المنتجات — صافي المبيعات بعد المرتجعات",
             ["المنتج","الوحدة","الكمية المباعة (صافي)","الإيراد (صافي)","الربح","متوسط السعر"],
             display,
@@ -2555,16 +2908,29 @@ class ShopApp(QWidget):
             [(r[0],r[1],fmt_qty(r[2]),money(r[3]),money(r[4])) for r in data],
             f"منتجات تحتاج إعادة طلب: {len(data)}")
 
-    # ✅ تقرير المرتجعات الجديد
     def rpt_returns(self):
-        data = rows("SELECT r.return_no,r.original_invoice,r.customer_name,"
-                    "r.payment_type,r.total,r.return_date "
-                    "FROM returns r ORDER BY r.id DESC LIMIT 1000")
-        total = sum(D(r[4]) for r in data)
-        self._set_report("🔄  سجل المرتجعات",
-            ["رقم المرتجع","الفاتورة الأصلية","العميل","طريقة الدفع","الإجمالي","التاريخ"],
-            [(r[0],r[1],r[2],r[3],money(r[4]),r[5]) for r in data],
-            f"إجمالي المرتجعات: {len(data)}   |   القيمة الإجمالية: {money(total)}")
+        # مرتجعات البيع
+        sales_ret = rows("SELECT return_no,original_invoice,customer_name,"
+                         "payment_type,total,return_date FROM returns ORDER BY id DESC LIMIT 500")
+        # مرتجعات الشراء
+        purch_ret = rows("SELECT return_no,original_purchase,supplier_name,"
+                         "payment_type,total,return_date FROM purchase_returns ORDER BY id DESC LIMIT 500")
+
+        display  = []
+        for r in sales_ret:
+            display.append(("مبيعات", r[0], r[1], r[2], r[3], money(r[4]), r[5]))
+        for r in purch_ret:
+            display.append(("مشتريات", r[0], r[1], r[2], r[3], money(r[4]), r[5]))
+        display.sort(key=lambda x: x[6], reverse=True)
+
+        tot_sales = sum(D(str(r[4])) for r in sales_ret)
+        tot_purch = sum(D(str(r[4])) for r in purch_ret)
+        self._set_report("🔄  سجل المرتجعات (بيع وشراء)",
+            ["النوع","رقم المرتجع","المرجع الأصلي","العميل/المورد","الدفع","الإجمالي","التاريخ"],
+            display,
+            f"مرتجعات مبيعات: {len(sales_ret)} ({money(tot_sales)})"
+            f"   |   مرتجعات مشتريات: {len(purch_ret)} ({money(tot_purch)})"
+            f"   |   إجمالي: {money(tot_sales+tot_purch)}")
 
     def rpt_custom_range(self):
         d_from   = self.rpt_from.date().toString("yyyy-MM-dd") + " 00:00:00"
@@ -2578,12 +2944,12 @@ class ShopApp(QWidget):
             total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
             rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
             # ✅ خصم المرتجعات في الفترة نفسها
-            ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+            ret_rows = rows("""SELECT ri.quantity,ri.total,si.price,si.cost
                          FROM returns r JOIN return_items ri ON ri.return_id=r.id
                          JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
                          WHERE r.return_date>=? AND r.return_date<=?""", (d_from, d_to))
-            ret_tot=D(ret[0]) if ret and ret[0] else Decimal("0")
-            ret_prf=D(ret[1]) if ret and ret[1] else Decimal("0")
+            ret_tot = sum(D(str(r[1])) for r in ret_rows)
+            ret_prf = sum(D(str(r[0]))*(D(str(r[2]))-D(str(r[3]))) for r in ret_rows)
             ret_note = (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي: {money(total-ret_tot)}"
                         f"   |   صافي ربح: {money(profit-ret_prf)}") if ret_tot>0 else ""
             self._set_report(f"📆  مبيعات من {lbl_from} لـ {lbl_to}",
