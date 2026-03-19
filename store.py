@@ -1417,12 +1417,23 @@ class ShopApp(QWidget):
         today = datetime.now().strftime("%Y-%m-%d")
         res = one("SELECT COUNT(*),COALESCE(SUM(total),0),COALESCE(SUM(profit),0) "
                   "FROM sales WHERE sale_date LIKE ?", (today+"%",))
+        # ✅ خصم المرتجعات من إجمالي اليوم والربح
+        ret = one("""
+            SELECT COALESCE(SUM(ri.total),0),
+                   COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+            FROM returns r
+            JOIN return_items ri ON ri.return_id=r.id
+            JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
+            WHERE r.return_date LIKE ?
+        """, (today+"%",))
         low = one("SELECT COUNT(*) FROM products WHERE quantity<?", (LOW_STOCK,))
         cnt, tot, prf = (res[0], D(res[1]), D(res[2])) if res else (0, Decimal("0"), Decimal("0"))
+        ret_tot = D(ret[0]) if ret and ret[0] else Decimal("0")
+        ret_prf = D(ret[1]) if ret and ret[1] else Decimal("0")
         lc = low[0] if low else 0
         self.stat_inv_lbl.setText(str(cnt))
-        self.stat_tot_lbl.setText(money(tot))
-        self.stat_prf_lbl.setText(money(prf))
+        self.stat_tot_lbl.setText(money(tot - ret_tot))
+        self.stat_prf_lbl.setText(money(prf - ret_prf))
         self.stat_low_lbl.setText(str(lc))
         if lc > 0:
             self.stat_low_lbl.setStyleSheet(f"color:{COLORS['red']};font-size:22px;font-weight:700;")
@@ -2391,9 +2402,12 @@ class ShopApp(QWidget):
         display = [(r[0],r[1],r[2],money(r[3]),money(r[4]),r[5]) for r in data]
         fill_table(self.cal_table, display)
         total  = sum(D(r[3]) for r in data); profit = sum(D(r[4]) for r in data)
+        ret_tot, ret_prf = self._get_returns_summary("return_date", date_str+"%")
+        ret_note = (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي: {money(total-ret_tot)}"
+                    f"   |   صافي ربح: {money(profit-ret_prf)}") if ret_tot > 0 else ""
         self.cal_day_lbl.setText(f"📅  {date_str}  —  {len(data)} فاتورة")
         self.cal_summary_lbl.setText(f"  مبيعات: {money(total)}   |   ربح: {money(profit)}"
-                                     f"   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
+                                     + ret_note + "   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
 
     def _set_report(self, title, headers, data, summary=""):
         self.rpt_title.setText(title)
@@ -2402,18 +2416,34 @@ class ShopApp(QWidget):
         fill_table(self.rpt_table, data)
         self.rpt_summary.setText(summary)
 
+    def _get_returns_summary(self, date_filter_col, date_val):
+        """دالة مساعدة: تحسب إجمالي المرتجعات وربحها لفترة معينة"""
+        ret = one(f"""
+            SELECT COALESCE(SUM(ri.total),0),
+                   COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+            FROM returns r
+            JOIN return_items ri ON ri.return_id=r.id
+            JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
+            WHERE r.{date_filter_col} LIKE ?
+        """, (date_val,))
+        return (D(ret[0]) if ret and ret[0] else Decimal("0"),
+                D(ret[1]) if ret and ret[1] else Decimal("0"))
+
     def rpt_daily(self):
         today = datetime.now().strftime("%Y-%m-%d")
         data  = rows("SELECT invoice_no,customer_name,payment_type,total,paid_amount,remaining,profit,sale_date "
                      "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC", (today+"%",))
         total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
         rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
+        ret_tot, ret_prf = self._get_returns_summary("return_date", today+"%")
+        ret_note = (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي مبيعات: {money(total-ret_tot)}"
+                    f"   |   صافي ربح: {money(profit-ret_prf)}") if ret_tot > 0 else ""
         self._set_report(f"📅  مبيعات اليوم — {today}",
             ["الفاتورة","العميل","الدفع","الإجمالي","المدفوع","المتبقي","الربح","الوقت"],
             [(r[0],r[1],r[2],money(r[3]),money(r[4]),money(r[5]),money(r[6]),r[7]) for r in data],
             f"فواتير: {len(data)}   |   مبيعات: {money(total)}   |   "
             f"المدفوع: {money(paid)}   |   المتبقي: {money(rem)}   |   أرباح: {money(profit)}"
-            f"   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها")
+            + ret_note + "   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها")
 
     def rpt_monthly(self):
         month = datetime.now().strftime("%Y-%m")
@@ -2421,11 +2451,14 @@ class ShopApp(QWidget):
                      "FROM sales WHERE sale_date LIKE ? ORDER BY id DESC", (month+"%",))
         total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
         rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
+        ret_tot, ret_prf = self._get_returns_summary("return_date", month+"%")
+        ret_note = (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي مبيعات: {money(total-ret_tot)}"
+                    f"   |   صافي ربح: {money(profit-ret_prf)}") if ret_tot > 0 else ""
         self._set_report(f"📆  مبيعات الشهر — {month}",
             ["الفاتورة","العميل","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"],
             [(r[0],r[1],r[2],money(r[3]),money(r[4]),money(r[5]),money(r[6]),r[7]) for r in data],
             f"فواتير: {len(data)}   |   مبيعات: {money(total)}   |   "
-            f"المدفوع: {money(paid)}   |   المتبقي: {money(rem)}   |   أرباح: {money(profit)}")
+            f"المدفوع: {money(paid)}   |   المتبقي: {money(rem)}   |   أرباح: {money(profit)}" + ret_note)
 
     def rpt_profit_monthly(self):
         data = rows("SELECT strftime('%Y-%m',sale_date),COUNT(*),ROUND(SUM(total),2),"
@@ -2436,31 +2469,69 @@ class ShopApp(QWidget):
         paid=D(res[2]) if res and res[2] else Decimal("0")
         rem=D(res[3]) if res and res[3] else Decimal("0")
         profit=D(res[4]) if res and res[4] else Decimal("0")
+        # إجمالي المرتجعات الكلية
+        all_ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+                         FROM return_items ri JOIN returns r ON ri.return_id=r.id
+                         JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id""")
+        ret_tot=D(all_ret[0]) if all_ret and all_ret[0] else Decimal("0")
+        ret_prf=D(all_ret[1]) if all_ret and all_ret[1] else Decimal("0")
         self._set_report("💰  الأرباح — تفصيل شهري",
             ["الشهر","عدد الفواتير","الإيراد","المدفوع","المتبقي","الربح"],
             [(r[0],str(r[1]),money(r[2]),money(r[3]),money(r[4]),money(r[5])) for r in data],
             f"الإجمالي: {money(total)}   |   المدفوع: {money(paid)}   |   "
-            f"المتبقي: {money(rem)}   |   الأرباح: {money(profit)}")
+            f"المتبقي: {money(rem)}   |   الأرباح: {money(profit)}"
+            + (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي مبيعات: {money(total-ret_tot)}"
+               f"   |   صافي ربح: {money(profit-ret_prf)}" if ret_tot>0 else ""))
 
     def rpt_all_invoices(self):
         data = rows("SELECT invoice_no,customer_name,payment_type,total,paid_amount,remaining,profit,sale_date "
                     "FROM sales ORDER BY id DESC LIMIT 2000")
         total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
         rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
+        all_ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+                         FROM return_items ri JOIN returns r ON ri.return_id=r.id
+                         JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id""")
+        ret_tot=D(all_ret[0]) if all_ret and all_ret[0] else Decimal("0")
+        ret_prf=D(all_ret[1]) if all_ret and all_ret[1] else Decimal("0")
         self._set_report("🧾  كل الفواتير",
             ["الفاتورة","العميل","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"],
             [(r[0],r[1],r[2],money(r[3]),money(r[4]),money(r[5]),money(r[6]),r[7]) for r in data],
             f"فواتير: {len(data)}   |   إيراد: {money(total)}   |   "
             f"المدفوع: {money(paid)}   |   المتبقي: {money(rem)}   |   أرباح: {money(profit)}"
-            f"   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها")
+            + (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي: {money(total-ret_tot)}"
+               f"   |   صافي ربح: {money(profit-ret_prf)}" if ret_tot>0 else "")
+            + "   ✦  انقر مرتين على الفاتورة لعرض تفاصيلها")
 
     def rpt_products(self):
-        data = rows("SELECT si.product_name,si.unit,SUM(si.quantity),"
-                    "ROUND(SUM(si.total),2),ROUND(SUM(si.profit),2),ROUND(AVG(si.price),2) "
-                    "FROM sale_items si GROUP BY si.product_id,si.product_name ORDER BY 3 DESC")
-        self._set_report("📦  أداء المنتجات — الأكثر مبيعاً",
-            ["المنتج","الوحدة","الكمية المباعة","الإيراد","الربح","متوسط السعر"],
-            [(r[0],r[1],fmt_qty(r[2]),money(r[3]),money(r[4]),money(r[5])) for r in data],
+        data = rows("""
+            SELECT si.product_name, si.unit,
+                   ROUND(SUM(si.quantity),3)       AS sold_qty,
+                   ROUND(SUM(si.total),2)           AS revenue,
+                   ROUND(SUM(si.profit),2)          AS profit,
+                   ROUND(AVG(si.price),2)            AS avg_price,
+                   COALESCE((
+                       SELECT SUM(ri.quantity) FROM return_items ri
+                       JOIN returns r ON ri.return_id=r.id
+                       WHERE ri.product_id=si.product_id
+                   ),0)                              AS ret_qty,
+                   COALESCE((
+                       SELECT SUM(ri.total) FROM return_items ri
+                       JOIN returns r ON ri.return_id=r.id
+                       WHERE ri.product_id=si.product_id
+                   ),0)                              AS ret_total
+            FROM sale_items si
+            GROUP BY si.product_id, si.product_name
+            ORDER BY sold_qty DESC
+        """)
+        display = []
+        for r in data:
+            net_qty = D(r[2]) - D(r[6])
+            net_rev = D(r[3]) - D(r[7])
+            display.append((r[0], r[1], fmt_qty(net_qty), money(net_rev),
+                            money(r[4]), money(r[5])))
+        self._set_report("📦  أداء المنتجات — صافي المبيعات بعد المرتجعات",
+            ["المنتج","الوحدة","الكمية المباعة (صافي)","الإيراد (صافي)","الربح","متوسط السعر"],
+            display,
             f"إجمالي المنتجات: {len(data)}")
 
     def rpt_customer_debts(self):
@@ -2506,17 +2577,26 @@ class ShopApp(QWidget):
                         "FROM sales WHERE sale_date>=? AND sale_date<=? ORDER BY id DESC", (d_from, d_to))
             total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
             rem=sum(D(r[5]) for r in data); profit=sum(D(r[6]) for r in data)
+            # ✅ خصم المرتجعات في الفترة نفسها
+            ret = one("""SELECT COALESCE(SUM(ri.total),0),COALESCE(SUM(ri.quantity*(si.price-si.cost)),0)
+                         FROM returns r JOIN return_items ri ON ri.return_id=r.id
+                         JOIN sale_items si ON si.sale_id=r.sale_id AND si.product_id=ri.product_id
+                         WHERE r.return_date>=? AND r.return_date<=?""", (d_from, d_to))
+            ret_tot=D(ret[0]) if ret and ret[0] else Decimal("0")
+            ret_prf=D(ret[1]) if ret and ret[1] else Decimal("0")
+            ret_note = (f"   |   🔄 مرتجعات: {money(ret_tot)}   |   صافي: {money(total-ret_tot)}"
+                        f"   |   صافي ربح: {money(profit-ret_prf)}") if ret_tot>0 else ""
             self._set_report(f"📆  مبيعات من {lbl_from} لـ {lbl_to}",
                 ["الفاتورة","العميل","الدفع","الإجمالي","المدفوع","المتبقي","الربح","التاريخ"],
                 [(r[0],r[1],r[2],money(r[3]),money(r[4]),money(r[5]),money(r[6]),r[7]) for r in data],
                 f"فواتير: {len(data)}   |   مبيعات: {money(total)}   |   "
                 f"المدفوع: {money(paid)}   |   المتبقي: {money(rem)}   |   أرباح: {money(profit)}"
-                f"   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
+                + ret_note + "   ✦  انقر مرتين لعرض تفاصيل الفاتورة")
         else:
             data = rows("SELECT id,supplier_name,payment_type,total,paid_amount,remaining,purchase_date "
                         "FROM purchases WHERE purchase_date>=? AND purchase_date<=? ORDER BY id DESC", (d_from, d_to))
             total=sum(D(r[3]) for r in data); paid=sum(D(r[4]) for r in data)
-            rem=sum(D(r[4]) for r in data)
+            rem=sum(D(r[5]) for r in data)   # ✅ إصلاح: كان r[4] خطأً
             self._set_report(f"🚚  مشتريات من {lbl_from} لـ {lbl_to}",
                 ["#","المورد","الطريقة","الإجمالي","المدفوع","المتبقي","التاريخ"],
                 [(str(r[0]),r[1],r[2],money(r[3]),money(r[4]),money(r[5]),r[6]) for r in data],
